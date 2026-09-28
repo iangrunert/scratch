@@ -7,6 +7,6 @@
   "files": ["index.js"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/iangrunert/scratch-.git"
+    "url": "git+https://github.com/iangrunert/scratch.git"
   }
 }
