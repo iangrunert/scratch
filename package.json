@@ -1,0 +1,12 @@
+{
+  "name": "@iangrunert/oidc-dist-tag-probe",
+  "version": "0.0.1",
+  "description": "throwaway: OIDC dist-tag probe",
+  "license": "MIT",
+  "private": false,
+  "files": ["index.js"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iangrunert/scratch-.git"
+  }
+}

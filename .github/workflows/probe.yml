@@ -1,0 +1,95 @@
+# One-off probe, run by hand on a throwaway package: can an npm token minted
+# by the trusted-publishing OIDC exchange move a dist-tag? Step 1 publishes a
+# new version over OIDC (proves the registration); steps 2 and 3 try dist-tag
+# add/rm with the minted token, through npm and through the raw API. No token
+# is ever printed.
+name: OIDC dist-tag probe
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+env:
+  REGISTRY: https://registry.npmjs.org
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4   # no registry-url: it would write a placeholder token npm then presents
+        with:
+          node-version: '24'
+      - name: npm must be 11.5.1 or newer; set this run's version (0.0.<run number>)
+        id: meta
+        run: |
+          set -euo pipefail
+          have=$(npm --version)
+          [[ "$(printf '%s\n' 11.5.1 "$have" | sort -V | head -n1)" == 11.5.1 ]] || { echo "::error::npm $have is too old"; exit 1; }
+          ver="0.0.$((GITHUB_RUN_NUMBER + 1))"
+          npm version "$ver" --no-git-tag-version >/dev/null
+          name=$(node -p "require('./package.json').name")
+          echo "name=$name" >> "$GITHUB_OUTPUT"; echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "npm $have; will publish $name@$ver"
+      - name: "Step 1: npm publish over OIDC (proves the trusted-publisher registration)"
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          set -euo pipefail
+          if npm publish --access public --tag next; then echo "publish over OIDC: WORKS"; else echo "::error::publish over OIDC: FAILS — fix the registration first"; exit 1; fi
+      - name: "Step 2: exchange the id token ourselves, then npm dist-tag add / rm with it"
+        id: exchange
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+          VER: ${{ steps.meta.outputs.ver }}
+        run: |
+          set -euo pipefail
+          hdr=$(mktemp -d); echo "hdr=$hdr" >> "$GITHUB_OUTPUT"
+          sep='?'; [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *\?* ]] && sep='&'
+          printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > "$hdr/github"
+          id_token=$(curl -sS --max-time 30 -H @"$hdr/github" -H 'Accept: application/json' \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}${sep}audience=npm:registry.npmjs.org" | jq -r '.value // empty')
+          [[ -n "$id_token" ]] || { echo "::error::GitHub issued no id token"; exit 1; }
+          printf 'Authorization: Bearer %s\n' "$id_token" > "$hdr/npm"
+          code=$(curl -sS --max-time 30 -X POST -H @"$hdr/npm" -H 'Accept: application/json' -H 'Content-Length: 0' \
+            -o "$hdr/body" -w '%{http_code}' "$REGISTRY/-/npm/v1/oidc/token/exchange/package/${NAME//\//%2f}")
+          msg=$(jq -r '[.message, .error] | map(select(type == "string")) | join("; ")' "$hdr/body" 2>/dev/null || true)
+          jq -e '.token | type == "string" and length > 0' "$hdr/body" >/dev/null 2>&1 || { echo "::error::exchange over OIDC: FAILS (HTTP $code${msg:+: $msg})"; exit 1; }
+          jq -r .token "$hdr/body" > "$hdr/token"; rm -f "$hdr/github" "$hdr/npm" "$hdr/body"
+          echo "exchange over OIDC: WORKS (HTTP $code)"
+          # npm dist-tag reads the token from config (lib/commands/dist-tag.js makes no OIDC exchange),
+          # so the minted token reaches it through an .npmrc line that expands NODE_AUTH_TOKEN.
+          printf '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}\n' > "$hdr/npmrc"
+          export NODE_AUTH_TOKEN="$(cat "$hdr/token")" NPM_CONFIG_USERCONFIG="$hdr/npmrc" NPM_CONFIG_REGISTRY="$REGISTRY/"
+          set +e
+          code() { grep -oE 'code [A-Z0-9_]+' <<<"$1" | head -n1; }
+          if out=$(npm dist-tag add "$NAME@$VER" oidc-probe 2>&1); then
+            echo "dist-tag add over OIDC: WORKS"
+            if out=$(npm dist-tag rm "$NAME" oidc-probe 2>&1); then echo "dist-tag rm over OIDC: WORKS"; else echo "dist-tag rm over OIDC: FAILS ($(code "$out"))"; fi
+          else
+            echo "dist-tag add over OIDC: FAILS ($(code "$out"))"
+          fi
+          exit 0
+      - name: "Step 3: the raw dist-tag PUT and DELETE with the exchanged token"
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+          VER: ${{ steps.meta.outputs.ver }}
+          HDR: ${{ steps.exchange.outputs.hdr }}
+        run: |
+          set -uo pipefail
+          printf 'Authorization: Bearer %s\n' "$(cat "$HDR/token")" > "$HDR/npm"
+          url="$REGISTRY/-/package/${NAME//\//%2f}/dist-tags/oidc-probe-2"
+          code=$(curl -sS --max-time 30 -X PUT -H @"$HDR/npm" -H 'Content-Type: application/json' --data "\"$VER\"" -o "$HDR/body" -w '%{http_code}' "$url")
+          msg=$(jq -r '[.message, .error] | map(select(type == "string")) | join("; ")' "$HDR/body" 2>/dev/null || true)
+          if [[ "$code" == 2* ]]; then
+            echo "raw dist-tag PUT over OIDC: WORKS (HTTP $code)"
+            code2=$(curl -sS --max-time 30 -X DELETE -H @"$HDR/npm" -o /dev/null -w '%{http_code}' "$url")
+            echo "raw dist-tag DELETE over OIDC: $([[ "$code2" == 2* ]] && echo WORKS || echo FAILS) (HTTP $code2)"
+          else
+            echo "raw dist-tag PUT over OIDC: FAILS (HTTP $code${msg:+: $msg})"
+          fi
+          rm -rf "$HDR"
+          exit 0
+      - name: Tags after the probe
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+        run: npm dist-tag ls "$NAME" --registry="$REGISTRY/"
