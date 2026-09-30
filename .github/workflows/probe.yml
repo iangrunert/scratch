@@ -1,7 +1,8 @@
 # One-off probe, run by hand on a throwaway package: can an npm token minted
 # by the trusted-publishing OIDC exchange move a dist-tag? Step 1 publishes a
 # new version over OIDC (proves the registration); steps 2 and 3 try dist-tag
-# add/rm with the minted token, through npm and through the raw API. No token
+# add/rm with the minted token, through npm and through the raw API. Step 3
+# (the registry's own answer) fails the run; step 2 only reports. No token
 # is ever printed.
 name: OIDC dist-tag probe
 on:
@@ -80,16 +81,23 @@ jobs:
           url="$REGISTRY/-/package/${NAME//\//%2f}/dist-tags/oidc-probe-2"
           code=$(curl -sS --max-time 30 -X PUT -H @"$HDR/npm" -H 'Content-Type: application/json' --data "\"$VER\"" -o "$HDR/body" -w '%{http_code}' "$url")
           msg=$(jq -r '[.message, .error] | map(select(type == "string")) | join("; ")' "$HDR/body" 2>/dev/null || true)
+          rc=1
           if [[ "$code" == 2* ]]; then
             echo "raw dist-tag PUT over OIDC: WORKS (HTTP $code)"
             code2=$(curl -sS --max-time 30 -X DELETE -H @"$HDR/npm" -o /dev/null -w '%{http_code}' "$url")
-            echo "raw dist-tag DELETE over OIDC: $([[ "$code2" == 2* ]] && echo WORKS || echo FAILS) (HTTP $code2)"
+            if [[ "$code2" == 2* ]]; then
+              echo "raw dist-tag DELETE over OIDC: WORKS (HTTP $code2)"; rc=0
+            else
+              echo "raw dist-tag DELETE over OIDC: FAILS (HTTP $code2)"
+            fi
           else
             echo "raw dist-tag PUT over OIDC: FAILS (HTTP $code${msg:+: $msg})"
           fi
           rm -rf "$HDR"
-          exit 0
+          [[ "$rc" == 0 ]] || echo "::error::the registry refused a dist-tag write with the OIDC-exchanged token"
+          exit "$rc"
       - name: Tags after the probe
+        if: ${{ !cancelled() && steps.meta.outcome == 'success' }}
         env:
           NAME: ${{ steps.meta.outputs.name }}
         run: npm dist-tag ls "$NAME" --registry="$REGISTRY/"
