@@ -67,9 +67,9 @@ jobs:
         shell: pwsh
         run: |
           cd schannel-sid-repro
-          $out = & .\schantest.exe $env:PROBE_HOST 443 2>&1 | Out-String
+          $out = & .\schantest.exe $env:PROBE_HOST 443 2>&1 | ForEach-Object { $_.ToString() }
           $code = $LASTEXITCODE
-          Write-Host $out
+          $out | Write-Host
           $out | Out-File -FilePath baseline.txt -Encoding utf8
           if ($code -ne 0) {
             Write-Host "::error::Baseline TLS failed on an unsandboxed token ($code failure(s)). The runner cannot reach $env:PROBE_HOST, so the sandbox comparison would be meaningless."
@@ -86,19 +86,27 @@ jobs:
           cd schannel-sid-repro
           icacls . /grant "*$($env:RESTRICTED_SID):(OI)(CI)(RX)" /t /q | Out-Null
           $exe = (Resolve-Path .\schantest.exe).Path
-          $out = & .\runrestricted.exe --restricted '--' $exe $env:PROBE_HOST 443 2>&1 | Out-String
-          Write-Host $out
+          $out = & .\runrestricted.exe --restricted '--' $exe $env:PROBE_HOST 443 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | Write-Host
           $out | Out-File -FilePath restricted.txt -Encoding utf8
 
-          $sspi = $out | Select-String -Pattern '^\[FAIL\]\s+[123]\.' -AllMatches
-          $verdict = if ($sspi) {
-            "SSPI unreachable under a restricting SID -- as predicted."
+          # $out is an ARRAY of lines. Piping a single Out-String blob to
+          # Select-String anchors ^ at the start of the whole blob, so the
+          # per-line patterns below never match -- that bug made an earlier
+          # run report the opposite of the truth.
+          $sspi    = @($out | Where-Object { $_ -match '^\[FAIL\]\s+[1-3]\.' })
+          $ranAny  = @($out | Where-Object { $_ -match '^\[(?: OK |FAIL|skip)\]' })
+          $verdict = if ($code -eq 3221225781) {
+            "Child died at DLL init (0xC0000142) -- window station/desktop DACL, not a TLS result."
           } elseif ($out -match 'CreateProcessAsUser\s+failed') {
-            "Process could not start; ACL or desktop problem, not a TLS result."
-          } elseif ($out -match '--- child output ---') {
-            "SSPI probes passed unexpectedly -- the premise needs revisiting."
+            "Process could not start; image ACL problem, not a TLS result."
+          } elseif ($sspi.Count -gt 0) {
+            "SSPI unreachable under a restricting SID -- as predicted ($($sspi.Count) of probes 1-3 failed)."
+          } elseif ($ranAny.Count -eq 0) {
+            "No probe output captured; the child produced nothing."
           } else {
-            "No child output captured."
+            "Probes 1-3 PASSED under a restricting SID -- the premise needs revisiting."
           }
           Write-Host "Verdict: $verdict"
           "restricted_verdict=$verdict" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -112,23 +120,31 @@ jobs:
           $dir = (Resolve-Path .).Path
           $exe = (Resolve-Path .\schantest.exe).Path
           $out = & .\runappcontainer.exe --name tls-check --internet `
-                   --grant-ro $dir '--' $exe $env:PROBE_HOST 443 2>&1 | Out-String
-          Write-Host $out
+                   --grant-ro $dir '--' $exe $env:PROBE_HOST 443 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | Write-Host
           $out | Out-File -FilePath appcontainer.txt -Encoding utf8
 
-          if ($out -notmatch '--- child output ---') {
-            Write-Host "::error::The AppContainer child produced no output; it likely never started."
+          # Three independent checks, because a single text match that silently
+          # stops matching is how a vacuous assertion passes for real.
+          $ran  = @($out | Where-Object { $_ -match '^\[(?: OK |FAIL|skip)\]' })
+          if ($ran.Count -eq 0) {
+            Write-Host "::error::The AppContainer child produced no probe output; it likely never started."
             exit 1
           }
           # Probes 1-5 are the claim: SSPI reached LSASS and the machine
           # certificate stores were readable. 6+ depend on egress policy.
-          $core = $out | Select-String -Pattern '^\[FAIL\]\s+[1-5]\.' -AllMatches
-          if ($core) {
+          $core = @($out | Where-Object { $_ -match '^\[FAIL\]\s+[1-5]\.' })
+          if ($core.Count -gt 0) {
             Write-Host "::error::SChannel does not work in an AppContainer on this runner. The approach does not hold:"
             $core | ForEach-Object { Write-Host "  $_" }
             exit 1
           }
-          Write-Host "AppContainer: SSPI and the certificate stores both work."
+          if ($code -ne 0) {
+            Write-Host "::error::Probes 1-5 passed but the run exited $code; a later probe failed."
+            exit 1
+          }
+          Write-Host "AppContainer: $($ran.Count) probes ran, none failed."
 
       - name: "nuget.exe restore inside the AppContainer"
         id: nuget
@@ -141,11 +157,26 @@ jobs:
           $tools = (Resolve-Path .\tools).Path
           $outdir = (Resolve-Path .\out).Path
 
+          # Left to itself NuGet walks the directory tree hunting for
+          # NuGet.Config and dies on "Access to the path 'C:\Users' is denied"
+          # -- the walk itself needs read access to ancestors we deliberately
+          # do not grant. Pinning the config removes the need for the hole.
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+            </packageSources>
+          </configuration>
+          '@ | Set-Content -Path "$tools\NuGet.Config" -Encoding utf8
+
           $out = & .\runappcontainer.exe --name nuget-sandbox --internet --nuget-state `
                    --grant-ro $tools --grant-rw $outdir `
                    '--' "$tools\nuget.exe" install Newtonsoft.Json -Version 13.0.3 `
-                      -OutputDirectory $outdir -NonInteractive 2>&1 | Out-String
-          Write-Host $out
+                      -OutputDirectory $outdir -ConfigFile "$tools\NuGet.Config" `
+                      -NonInteractive 2>&1 | ForEach-Object { $_.ToString() }
+          $out | Write-Host
           $out | Out-File -FilePath nuget.txt -Encoding utf8
 
           $dll = Get-ChildItem -Path $outdir -Filter Newtonsoft.Json.dll -Recurse `

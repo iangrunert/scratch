@@ -80,12 +80,14 @@ broken transport apart from a broken trust store. Run it both ways.
    looks nothing like a TLS problem. The launcher prints this hint when it sees
    that error.
 
-2. **Window station / desktop.** If the child dies instantly with exit code
-   `0xC0000142`, that is DLL initialisation failing because the restricting SID
-   has no access to `winsta0\default` — not a TLS result. Chromium's sandbox
-   handles this by granting the sandbox an alternate desktop. For a quick
-   experiment, grant access to the existing one or accept that this launcher is
-   a diagnostic rather than a sandbox.
+2. **Window station / desktop.** `runrestricted` now grants the restricting
+   SID access to the process window station and thread desktop before
+   launching, because without it the child dies at DLL init with
+   `0xC0000142` before executing a single instruction — no output, no probe
+   results, and a failure that looks like nothing at all. CI hit exactly this
+   on the first run. Chromium's sandbox solves it by handing the sandbox an
+   alternate desktop; widening the existing one is enough for a diagnostic,
+   but it is a real reason this launcher is a diagnostic and not a sandbox.
 
 ## Reading the output
 
@@ -233,10 +235,35 @@ it only if cold restores are genuinely too slow.
   calls fail. Irrelevant for NuGet; relevant if you point this at something
   that expects to be a real packaged app.
 
-## Status
+## Verified results
 
-`runappcontainer.c` cross-compiles clean for x64 and x86 but, like the probe,
-**has not been executed on Windows**.
+From CI on `windows-latest` (run 1, commit `d480c5a`):
+
+- **AppContainer: all 14 probes pass.** `EnumerateSecurityPackages` saw 12
+  packages, `CertOpenSystemStore(ROOT)` saw 571 roots, `HKLM
+  SystemCertificates` 552 entries, the handshake negotiated TLS 1.2 with
+  AES-256 and ECDHE, `CertVerifyChainPolicy` trusted the chain, and
+  `EncryptMessage`/`DecryptMessage` moved a real HTTP request. The token dump
+  confirms `AppContainer: yes`, `Restricting SIDs: 0`, low integrity.
+  **SChannel works in a lowbox.**
+- **Restricting SID: not yet demonstrated.** The child exited `0xC0000142`
+  with no output — the window station problem above, since fixed. The claim
+  that restricting SIDs break SSPI is still reasoning plus documentation, not
+  evidence from this repo.
+- **NuGet: needs its config pinned.** Left alone it walks the directory tree
+  looking for `NuGet.Config` and fails with *Access to the path 'C:\Users' is
+  denied* — the walk itself wants read access to ancestors that should not be
+  granted. Passing `-ConfigFile` with a config inside an already-granted
+  directory removes the need for the hole rather than opening one. This is the
+  general lesson for sandboxing a tool: pin its config, do not let it search.
+
+One caveat on how these were checked. The first run's assertions piped an
+`Out-String` blob to `Select-String` with a `^`-anchored pattern. That anchors
+at the start of the whole blob, so the per-line patterns never matched and the
+AppContainer check could not fail. The result above is trustworthy because the
+probe's own summary line and exit code say so, not because that assertion
+passed. The workflow now splits output into lines and cross-checks the exit
+code.
 
 ---
 

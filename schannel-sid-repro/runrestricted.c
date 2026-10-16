@@ -27,6 +27,7 @@
 #include "childio.h"
 
 #include <sddl.h>
+#include <aclapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,95 @@ static int set_low_integrity(HANDLE tok)
         sandbox_err("SetTokenInformation(TokenIntegrityLevel)", GetLastError());
     LocalFree(low);
     return ok;
+}
+
+/* Grant a SID access to the window station and desktop.
+ *
+ * Without this a restricted-token child dies at DLL init with 0xC0000142
+ * before executing a single instruction, because something in its import
+ * graph touches user32 and the lowbox/restricted token has no access to
+ * winsta0 or its default desktop. That failure looks like nothing at all:
+ * no output, no probe results. Chromium's sandbox solves it by handing the
+ * sandbox an alternate desktop; for a diagnostic, widening the existing one
+ * is enough.
+ *
+ * The window station needs two ACEs with different inheritance -- one
+ * inherit-only entry for the desktops it contains, one non-propagating entry
+ * for the station itself. This is the shape the Windows SDK sample uses.
+ */
+#define WINSTA_WANTED (WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES | \
+                       WINSTA_ACCESSCLIPBOARD | WINSTA_CREATEDESKTOP | \
+                       WINSTA_WRITEATTRIBUTES | WINSTA_ACCESSGLOBALATOMS | \
+                       WINSTA_EXITWINDOWS | WINSTA_ENUMERATE | \
+                       WINSTA_READSCREEN | STANDARD_RIGHTS_REQUIRED)
+
+#define DESKTOP_WANTED (DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | \
+                        DESKTOP_CREATEMENU | DESKTOP_HOOKCONTROL | \
+                        DESKTOP_JOURNALRECORD | DESKTOP_JOURNALPLAYBACK | \
+                        DESKTOP_ENUMERATE | DESKTOP_WRITEOBJECTS | \
+                        DESKTOP_SWITCHDESKTOP | STANDARD_RIGHTS_REQUIRED)
+
+static int grant_object(HANDLE obj, EXPLICIT_ACCESSW *ea, ULONG n,
+                        const char *what)
+{
+    PACL old_dacl = NULL, new_dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD err;
+
+    err = GetSecurityInfo(obj, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                          NULL, NULL, &old_dacl, NULL, &sd);
+    if (err != ERROR_SUCCESS) {
+        sandbox_err(what, err);
+        return 0;
+    }
+
+    err = SetEntriesInAclW(n, ea, old_dacl, &new_dacl);
+    if (err != ERROR_SUCCESS) {
+        sandbox_err("SetEntriesInAcl", err);
+        LocalFree(sd);
+        return 0;
+    }
+
+    err = SetSecurityInfo(obj, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                          NULL, NULL, new_dacl, NULL);
+    if (err != ERROR_SUCCESS)
+        sandbox_err(what, err);
+
+    LocalFree(new_dacl);
+    LocalFree(sd);
+    return err == ERROR_SUCCESS;
+}
+
+static void fill_ea(EXPLICIT_ACCESSW *ea, PSID sid, DWORD access, DWORD inherit)
+{
+    memset(ea, 0, sizeof *ea);
+    ea->grfAccessPermissions = access;
+    ea->grfAccessMode = GRANT_ACCESS;
+    ea->grfInheritance = inherit;
+    ea->Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea->Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    ea->Trustee.ptstrName = (LPWSTR)sid;
+}
+
+static void grant_station_and_desktop(PSID sid)
+{
+    HWINSTA ws = GetProcessWindowStation();
+    HDESK   dk = GetThreadDesktop(GetCurrentThreadId());
+    EXPLICIT_ACCESSW ea[2];
+
+    if (ws) {
+        fill_ea(&ea[0], sid, GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE |
+                             GENERIC_ALL,
+                CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE);
+        fill_ea(&ea[1], sid, WINSTA_WANTED, NO_PROPAGATE_INHERIT_ACE);
+        if (grant_object(ws, ea, 2, "window station DACL"))
+            printf("  granted window station\n");
+    }
+    if (dk) {
+        fill_ea(&ea[0], sid, DESKTOP_WANTED, 0);
+        if (grant_object(dk, ea, 1, "desktop DACL"))
+            printf("  granted desktop\n");
+    }
 }
 
 int main(int argc, char **argv)
@@ -172,6 +262,10 @@ int main(int argc, char **argv)
 
     if (low && !set_low_integrity(tok))
         goto out;
+
+    /* The child cannot initialise at all without this; see the comment on
+       grant_station_and_desktop. */
+    grant_station_and_desktop(deny_only ? dsid : rsid);
 
     printf("  launching: %ls\n", cmdline);
 
