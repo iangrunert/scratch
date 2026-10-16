@@ -37,7 +37,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 
-#include <windows.h>
+#include "childio.h"
+
 #include <userenv.h>
 #include <sddl.h>
 #include <aclapi.h>
@@ -63,17 +64,6 @@ typedef struct {
     wchar_t path[MAX_PATH];
     int     writable;
 } grant;
-
-static void whine(const char *what, DWORD e)
-{
-    char msg[256];
-    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM |
-                             FORMAT_MESSAGE_IGNORE_INSERTS,
-                             NULL, e, 0, msg, sizeof msg, NULL);
-    while (n && (msg[n - 1] == '\n' || msg[n - 1] == '\r'))
-        msg[--n] = '\0';
-    printf("  %-28s failed: 0x%08lX %s\n", what, (unsigned long)e, n ? msg : "");
-}
 
 static void usage(void)
 {
@@ -106,12 +96,12 @@ static PSID ensure_profile(const wchar_t *name)
         return sid;
     }
     if (hr != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
-        whine("CreateAppContainerProfile", (DWORD)hr);
+        sandbox_err("CreateAppContainerProfile", (DWORD)hr);
         return NULL;
     }
     hr = DeriveAppContainerSidFromAppContainerName(name, &sid);
     if (FAILED(hr)) {
-        whine("DeriveAppContainerSid", (DWORD)hr);
+        sandbox_err("DeriveAppContainerSid", (DWORD)hr);
         return NULL;
     }
     printf("  reusing profile          %ls\n", name);
@@ -135,7 +125,7 @@ static int grant_path(const wchar_t *path, PSID sid, int writable)
                                 DACL_SECURITY_INFORMATION, NULL, NULL,
                                 &old_dacl, NULL, &sd);
     if (err != ERROR_SUCCESS) {
-        whine("GetNamedSecurityInfo", err);
+        sandbox_err("GetNamedSecurityInfo", err);
         printf("    path: %ls\n", path);
         return 0;
     }
@@ -152,7 +142,7 @@ static int grant_path(const wchar_t *path, PSID sid, int writable)
 
     err = SetEntriesInAclW(1, &ea, old_dacl, &new_dacl);
     if (err != ERROR_SUCCESS) {
-        whine("SetEntriesInAcl", err);
+        sandbox_err("SetEntriesInAcl", err);
         LocalFree(sd);
         return 0;
     }
@@ -161,7 +151,7 @@ static int grant_path(const wchar_t *path, PSID sid, int writable)
                                 DACL_SECURITY_INFORMATION, NULL, NULL,
                                 new_dacl, NULL);
     if (err != ERROR_SUCCESS) {
-        whine("SetNamedSecurityInfo", err);
+        sandbox_err("SetNamedSecurityInfo", err);
         printf("    path: %ls\n", path);
         LocalFree(new_dacl);
         LocalFree(sd);
@@ -187,14 +177,14 @@ static int redirect_nuget_state(PSID sid)
     HRESULT hr;
 
     if (!ConvertSidToStringSidW(sid, &sid_str)) {
-        whine("ConvertSidToStringSid", GetLastError());
+        sandbox_err("ConvertSidToStringSid", GetLastError());
         return 0;
     }
 
     hr = GetAppContainerFolderPath(sid_str, &folder);
     LocalFree(sid_str);
     if (FAILED(hr) || !folder) {
-        whine("GetAppContainerFolderPath", (DWORD)hr);
+        sandbox_err("GetAppContainerFolderPath", (DWORD)hr);
         return 0;
     }
 
@@ -213,7 +203,7 @@ static int redirect_nuget_state(PSID sid)
         buf[MAX_PATH - 1] = L'\0';
         if (!CreateDirectoryW(buf, NULL) &&
             GetLastError() != ERROR_ALREADY_EXISTS) {
-            whine("CreateDirectory", GetLastError());
+            sandbox_err("CreateDirectory", GetLastError());
             printf("    path: %ls\n", buf);
             CoTaskMemFree(folder);
             return 0;
@@ -221,7 +211,7 @@ static int redirect_nuget_state(PSID sid)
         /* Set in our own environment; the child inherits it because we pass
            NULL for lpEnvironment. */
         if (!SetEnvironmentVariableW(map[i].var, buf)) {
-            whine("SetEnvironmentVariable", GetLastError());
+            sandbox_err("SetEnvironmentVariable", GetLastError());
             CoTaskMemFree(folder);
             return 0;
         }
@@ -261,128 +251,6 @@ static wchar_t *build_cmdline(int argc, char **argv, int from)
         if (quote)    wcscat(out, L"\"");
     }
     return out;
-}
-
-/* ------------------------------------------------------------- the launch */
-
-/* stdout and stderr go through one pipe so ordering is preserved, and stdin is
-   NUL. Console handle inheritance into a lowbox is unreliable -- conhost may
-   refuse the lowbox token -- so redirecting is not optional here. The handle
-   list also stops any other inheritable handle leaking into the sandbox. */
-static int launch(wchar_t *cmdline, PSID sid, PSID *caps, DWORD cap_count,
-                  DWORD *exit_code)
-{
-    SECURITY_CAPABILITIES sc;
-    SID_AND_ATTRIBUTES cap_attrs[4];
-    STARTUPINFOEXW six;
-    PROCESS_INFORMATION pi;
-    SECURITY_ATTRIBUTES sa;
-    HANDLE rd = NULL, wr = NULL, nul = NULL;
-    HANDLE inherit[2];
-    SIZE_T attr_size = 0;
-    int ok = 0;
-
-    memset(&sc, 0, sizeof sc);
-    sc.AppContainerSid = sid;
-    sc.CapabilityCount = cap_count;
-    if (cap_count) {
-        for (DWORD i = 0; i < cap_count && i < 4; i++) {
-            cap_attrs[i].Sid = caps[i];
-            cap_attrs[i].Attributes = SE_GROUP_ENABLED;
-        }
-        sc.Capabilities = cap_attrs;
-    }
-
-    memset(&six, 0, sizeof six);
-    memset(&sa, 0, sizeof sa);
-    sa.nLength = sizeof sa;
-    sa.bInheritHandle = TRUE;
-
-    if (!CreatePipe(&rd, &wr, &sa, 0)) {
-        whine("CreatePipe", GetLastError());
-        return 0;
-    }
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                      &sa, OPEN_EXISTING, 0, NULL);
-    if (nul == INVALID_HANDLE_VALUE) {
-        whine("CreateFile(NUL)", GetLastError());
-        goto out;
-    }
-
-    six.StartupInfo.cb = sizeof six;
-    six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    six.StartupInfo.hStdInput = nul;
-    six.StartupInfo.hStdOutput = wr;
-    six.StartupInfo.hStdError = wr;
-
-    InitializeProcThreadAttributeList(NULL, 2, 0, &attr_size);
-    six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
-    if (!six.lpAttributeList ||
-        !InitializeProcThreadAttributeList(six.lpAttributeList, 2, 0, &attr_size)) {
-        whine("InitializeProcThreadAttributeList", GetLastError());
-        goto out;
-    }
-
-    if (!UpdateProcThreadAttribute(six.lpAttributeList, 0,
-                                   PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                                   &sc, sizeof sc, NULL, NULL)) {
-        whine("UpdateProcThreadAttribute(caps)", GetLastError());
-        goto out_attr;
-    }
-
-    inherit[0] = nul;
-    inherit[1] = wr;   /* stdout and stderr both point here */
-    if (!UpdateProcThreadAttribute(six.lpAttributeList, 0,
-                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   inherit, sizeof inherit, NULL, NULL)) {
-        whine("UpdateProcThreadAttribute(handles)", GetLastError());
-        goto out_attr;
-    }
-
-    memset(&pi, 0, sizeof pi);
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
-                        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                        NULL, NULL, &six.StartupInfo, &pi)) {
-        DWORD e = GetLastError();
-        whine("CreateProcess", e);
-        if (e == ERROR_ACCESS_DENIED)
-            printf("\n  The sandbox cannot read the command's own image.\n"
-                   "  Grant its directory: --grant-ro <dir containing the exe>\n");
-        goto out_attr;
-    }
-
-    /* Close our copies of the write ends or the read loop never sees EOF. */
-    CloseHandle(wr);
-    wr = NULL;
-    CloseHandle(nul);
-    nul = NULL;
-
-    printf("\n--- child output ---\n");
-    for (;;) {
-        char buf[4096];
-        DWORD n = 0;
-        if (!ReadFile(rd, buf, sizeof buf, &n, NULL) || n == 0)
-            break;
-        fwrite(buf, 1, n, stdout);
-        fflush(stdout);
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    ok = 1;
-
-out_attr:
-    DeleteProcThreadAttributeList(six.lpAttributeList);
-out:
-    free(six.lpAttributeList);
-    if (rd)  CloseHandle(rd);
-    if (wr)  CloseHandle(wr);
-    if (nul && nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    return ok;
 }
 
 /* ------------------------------------------------------------------- main */
@@ -435,7 +303,7 @@ int main(int argc, char **argv)
     if (del_profile) {
         HRESULT hr = DeleteAppContainerProfile(name);
         if (FAILED(hr)) {
-            whine("DeleteAppContainerProfile", (DWORD)hr);
+            sandbox_err("DeleteAppContainerProfile", (DWORD)hr);
             return 1;
         }
         printf("  deleted profile %ls\n", name);
@@ -494,9 +362,28 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (launch(cmdline, sid, caps, cap_count, &exit_code)) {
-        printf("\n  child exit code: %lu\n", (unsigned long)exit_code);
-        rc = (int)exit_code;
+    {
+        SECURITY_CAPABILITIES sc;
+        SID_AND_ATTRIBUTES cap_attrs[2];
+        child_opts opts;
+
+        memset(&sc, 0, sizeof sc);
+        sc.AppContainerSid = sid;
+        sc.CapabilityCount = cap_count;
+        for (DWORD i = 0; i < cap_count; i++) {
+            cap_attrs[i].Sid = caps[i];
+            cap_attrs[i].Attributes = SE_GROUP_ENABLED;
+        }
+        if (cap_count)
+            sc.Capabilities = cap_attrs;
+
+        memset(&opts, 0, sizeof opts);
+        opts.caps = &sc;
+
+        if (run_child_capture(cmdline, &opts, &exit_code)) {
+            printf("\n  child exit code: %lu\n", (unsigned long)exit_code);
+            rc = (int)exit_code;
+        }
     }
 
 out:

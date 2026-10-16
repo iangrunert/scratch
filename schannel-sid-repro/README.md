@@ -237,3 +237,31 @@ it only if cold restores are genuinely too slow.
 
 `runappcontainer.c` cross-compiles clean for x64 and x86 but, like the probe,
 **has not been executed on Windows**.
+
+---
+
+# CI
+
+`.github/workflows/windows-sandbox.yml` runs the whole comparison on a real
+`windows-latest` runner, which is how the "not executed on Windows" caveats
+above get retired. Four steps:
+
+1. **Baseline, unsandboxed** — must pass. If it fails, the runner cannot reach
+   the probe host and the rest of the comparison is meaningless.
+2. **Restricting SID** — recorded as evidence, never fails the job. Its failure
+   *is* the finding. The step distinguishes "SSPI unreachable" from "the
+   process never started", which is why the launchers capture child output
+   through a pipe rather than trusting console inheritance.
+3. **AppContainer** — probes 1–5 must pass. This is the claim: SSPI reached
+   LSASS and the machine certificate stores were readable.
+4. **`nuget.exe install` inside the AppContainer** — the real workload, with
+   `--nuget-state` and the two grants. Asserts the `.dll` actually landed.
+
+Output from all four is attached as an artifact and rendered into the run
+summary, so a failure is diagnosable without a local Windows box. The profiles
+are deleted in an `always()` step, since `CreateAppContainerProfile` leaves
+persistent HKCU state and a profile directory behind.
+
+A separate Linux job cross-compiles all four translation units for x64 and
+x86 under `-Wall -Wextra`, which is cheap and catches portability regressions
+in the launcher code.

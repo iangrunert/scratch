@@ -24,7 +24,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 
-#include <windows.h>
+#include "childio.h"
+
 #include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,18 +39,6 @@ static void usage(void)
 {
     printf("usage: runrestricted.exe [--restricted|--null|--deny-only] [--low] "
            "-- <command> [args...]\n");
-}
-
-static void whine(const char *what)
-{
-    DWORD e = GetLastError();
-    char msg[256];
-    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM |
-                             FORMAT_MESSAGE_IGNORE_INSERTS,
-                             NULL, e, 0, msg, sizeof msg, NULL);
-    while (n && (msg[n - 1] == '\n' || msg[n - 1] == '\r'))
-        msg[--n] = '\0';
-    printf("  %s failed: %lu %s\n", what, (unsigned long)e, n ? msg : "");
 }
 
 /* Join the remaining argv into one command line, quoting what needs it. The
@@ -93,7 +82,7 @@ static int set_low_integrity(HANDLE tok)
     int ok;
 
     if (!ConvertStringSidToSidW(L"S-1-16-4096", &low)) {
-        whine("ConvertStringSidToSid(low integrity)");
+        sandbox_err("ConvertStringSidToSid(low integrity)", GetLastError());
         return 0;
     }
     memset(&tml, 0, sizeof tml);
@@ -103,7 +92,7 @@ static int set_low_integrity(HANDLE tok)
     ok = SetTokenInformation(tok, TokenIntegrityLevel, &tml,
                              (DWORD)(sizeof tml + GetLengthSid(low)));
     if (!ok)
-        whine("SetTokenInformation(TokenIntegrityLevel)");
+        sandbox_err("SetTokenInformation(TokenIntegrityLevel)", GetLastError());
     LocalFree(low);
     return ok;
 }
@@ -120,8 +109,6 @@ int main(int argc, char **argv)
     SID_AND_ATTRIBUTES deny[1];
     PSID rsid = NULL, dsid = NULL;
     wchar_t *cmdline = NULL;
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
     DWORD exit_code = 1;
     int rc = 1;
 
@@ -147,7 +134,7 @@ int main(int argc, char **argv)
     if (!OpenProcessToken(GetCurrentProcess(),
                           TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
                           &self)) {
-        whine("OpenProcessToken");
+        sandbox_err("OpenProcessToken", GetLastError());
         goto out;
     }
 
@@ -155,7 +142,7 @@ int main(int argc, char **argv)
         /* Deny-only on Administrators, plus drop every privilege we can. No
            restricting SIDs, so access checks stay single-pass. */
         if (!ConvertStringSidToSidW(L"S-1-5-32-544", &dsid)) {
-            whine("ConvertStringSidToSid(Administrators)");
+            sandbox_err("ConvertStringSidToSid(Administrators)", GetLastError());
             goto out;
         }
         deny[0].Sid = dsid;
@@ -164,12 +151,12 @@ int main(int argc, char **argv)
                low ? ", low integrity" : "");
         if (!CreateRestrictedToken(self, DISABLE_MAX_PRIVILEGE,
                                    1, deny, 0, NULL, 0, NULL, &tok)) {
-            whine("CreateRestrictedToken");
+            sandbox_err("CreateRestrictedToken", GetLastError());
             goto out;
         }
     } else {
         if (!ConvertStringSidToSidW(restrict_sid, &rsid)) {
-            whine("ConvertStringSidToSid(restricting SID)");
+            sandbox_err("ConvertStringSidToSid(restricting SID)", GetLastError());
             goto out;
         }
         restricting[0].Sid = rsid;
@@ -178,7 +165,7 @@ int main(int argc, char **argv)
                restrict_sid, low ? ", low integrity" : "");
         if (!CreateRestrictedToken(self, DISABLE_MAX_PRIVILEGE,
                                    0, NULL, 0, NULL, 1, restricting, &tok)) {
-            whine("CreateRestrictedToken");
+            sandbox_err("CreateRestrictedToken", GetLastError());
             goto out;
         }
     }
@@ -186,28 +173,19 @@ int main(int argc, char **argv)
     if (low && !set_low_integrity(tok))
         goto out;
 
-    printf("  launching: %ls\n\n", cmdline);
+    printf("  launching: %ls\n", cmdline);
 
-    memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    memset(&pi, 0, sizeof pi);
-
-    if (!CreateProcessAsUserW(tok, NULL, cmdline, NULL, NULL, FALSE,
-                              0, NULL, NULL, &si, &pi)) {
-        DWORD e = GetLastError();
-        whine("CreateProcessAsUser");
-        if (e == ERROR_ACCESS_DENIED) {
-            printf("\n  The child could not read its own image. Under a\n"
-                   "  restricting SID the file DACL must grant that SID too:\n"
-                   "    icacls <dir> /grant *%ls:(RX) /t\n", restrict_sid);
+    {
+        child_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.token = tok;
+        if (!run_child_capture(cmdline, &opts, &exit_code)) {
+            printf("\n  Under a restricting SID the image's DACL must grant\n"
+                   "  that SID too:  icacls <dir> /grant *%ls:(RX) /t\n",
+                   restrict_sid);
+            goto out;
         }
-        goto out;
     }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
 
     printf("\n  child exit code: %lu", (unsigned long)exit_code);
     if (exit_code == 0xC0000142)

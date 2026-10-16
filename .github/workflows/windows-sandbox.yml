@@ -1,0 +1,206 @@
+# Does Windows TLS survive each sandbox token? Three runs of the same probe on
+# a real Windows runner answer it: unsandboxed (baseline), under a restricting
+# SID (expected to break SSPI), and in an AppContainer (expected to work).
+# Then nuget.exe restores a package inside the AppContainer, which is the
+# actual thing we want sandboxed.
+#
+# The restricted run is recorded as evidence and never fails the job -- its
+# failure IS the finding. The baseline and AppContainer runs are assertions:
+# if the baseline fails the runner is unfit to test, and if the AppContainer
+# run fails the premise is wrong.
+name: Windows sandbox TLS matrix
+on:
+  push:
+    branches: [schannel-sandbox-repro]
+    paths:
+      - 'schannel-sid-repro/**'
+      - '.github/workflows/windows-sandbox.yml'
+  workflow_dispatch:
+    inputs:
+      host:
+        description: TLS host to probe
+        default: api.nuget.org
+permissions:
+  contents: read
+env:
+  PROBE_HOST: ${{ github.event.inputs.host || 'api.nuget.org' }}
+  RESTRICTED_SID: S-1-5-12
+
+jobs:
+  cross-compile:
+    name: Cross-compile (mingw-w64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all three with -Wall -Wextra, x64 and x86
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          cd schannel-sid-repro
+          sh build.sh
+          for f in schantest runrestricted runappcontainer childio; do
+            i686-w64-mingw32-gcc -O2 -Wall -Wextra -Wno-unused-parameter \
+              -c -o /dev/null "$f.c"
+          done
+          echo "x64 and x86 both clean"
+
+  windows:
+    name: Probe on windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # vswhere rather than a pinned VS path: the runner image moves the
+      # edition around between releases.
+      - name: Build with MSVC
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          if not defined VSPATH (echo ::error::vswhere found no VC toolchain & exit /b 1)
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cd schannel-sid-repro
+          call build.bat || exit /b 1
+
+      - name: "Run 1 of 3: baseline, no sandbox (must pass)"
+        id: baseline
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          $out = & .\schantest.exe $env:PROBE_HOST 443 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          $out | Out-File -FilePath baseline.txt -Encoding utf8
+          if ($code -ne 0) {
+            Write-Host "::error::Baseline TLS failed on an unsandboxed token ($code failure(s)). The runner cannot reach $env:PROBE_HOST, so the sandbox comparison would be meaningless."
+            exit 1
+          }
+          Write-Host "Baseline: all probes passed."
+
+      # The image must be readable by the restricting SID or the process cannot
+      # start at all -- a denial that looks nothing like a TLS fault.
+      - name: "Run 2 of 3: restricting SID (evidence, never fails the job)"
+        id: restricted
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          icacls . /grant "*$($env:RESTRICTED_SID):(OI)(CI)(RX)" /t /q | Out-Null
+          $exe = (Resolve-Path .\schantest.exe).Path
+          $out = & .\runrestricted.exe --restricted '--' $exe $env:PROBE_HOST 443 2>&1 | Out-String
+          Write-Host $out
+          $out | Out-File -FilePath restricted.txt -Encoding utf8
+
+          $sspi = $out | Select-String -Pattern '^\[FAIL\]\s+[123]\.' -AllMatches
+          $verdict = if ($sspi) {
+            "SSPI unreachable under a restricting SID -- as predicted."
+          } elseif ($out -match 'CreateProcessAsUser\s+failed') {
+            "Process could not start; ACL or desktop problem, not a TLS result."
+          } elseif ($out -match '--- child output ---') {
+            "SSPI probes passed unexpectedly -- the premise needs revisiting."
+          } else {
+            "No child output captured."
+          }
+          Write-Host "Verdict: $verdict"
+          "restricted_verdict=$verdict" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0
+
+      - name: "Run 3 of 3: AppContainer (probes 1-5 must pass)"
+        id: appcontainer
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          $dir = (Resolve-Path .).Path
+          $exe = (Resolve-Path .\schantest.exe).Path
+          $out = & .\runappcontainer.exe --name tls-check --internet `
+                   --grant-ro $dir '--' $exe $env:PROBE_HOST 443 2>&1 | Out-String
+          Write-Host $out
+          $out | Out-File -FilePath appcontainer.txt -Encoding utf8
+
+          if ($out -notmatch '--- child output ---') {
+            Write-Host "::error::The AppContainer child produced no output; it likely never started."
+            exit 1
+          }
+          # Probes 1-5 are the claim: SSPI reached LSASS and the machine
+          # certificate stores were readable. 6+ depend on egress policy.
+          $core = $out | Select-String -Pattern '^\[FAIL\]\s+[1-5]\.' -AllMatches
+          if ($core) {
+            Write-Host "::error::SChannel does not work in an AppContainer on this runner. The approach does not hold:"
+            $core | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "AppContainer: SSPI and the certificate stores both work."
+
+      - name: "nuget.exe restore inside the AppContainer"
+        id: nuget
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          New-Item -ItemType Directory -Force -Path tools, out | Out-Null
+          Invoke-WebRequest -Uri https://dist.nuget.org/win-x86-commandline/latest/nuget.exe `
+                            -OutFile tools\nuget.exe
+          $tools = (Resolve-Path .\tools).Path
+          $outdir = (Resolve-Path .\out).Path
+
+          $out = & .\runappcontainer.exe --name nuget-sandbox --internet --nuget-state `
+                   --grant-ro $tools --grant-rw $outdir `
+                   '--' "$tools\nuget.exe" install Newtonsoft.Json -Version 13.0.3 `
+                      -OutputDirectory $outdir -NonInteractive 2>&1 | Out-String
+          Write-Host $out
+          $out | Out-File -FilePath nuget.txt -Encoding utf8
+
+          $dll = Get-ChildItem -Path $outdir -Filter Newtonsoft.Json.dll -Recurse `
+                               -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "::error::nuget.exe did not produce Newtonsoft.Json.dll inside the AppContainer."
+            exit 1
+          }
+          Write-Host "Restored: $($dll.FullName)"
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          $md = @()
+          $md += "## Windows sandbox TLS matrix"
+          $md += ""
+          $md += "Probe host: ``$env:PROBE_HOST``"
+          $md += ""
+          $md += "| Run | Result |"
+          $md += "| --- | --- |"
+          $md += "| Baseline, no sandbox | ${{ steps.baseline.outcome }} |"
+          $md += "| Restricting SID (evidence) | ${{ steps.restricted.outcome }} |"
+          $md += "| AppContainer | ${{ steps.appcontainer.outcome }} |"
+          $md += "| nuget.exe in AppContainer | ${{ steps.nuget.outcome }} |"
+          $md += ""
+          $md += "Restricting-SID verdict: ${{ steps.restricted.outputs.restricted_verdict }}"
+          foreach ($f in 'baseline','restricted','appcontainer','nuget') {
+            if (Test-Path "$f.txt") {
+              $md += ""
+              $md += "<details><summary>$f</summary>"
+              $md += ""
+              $md += '```'
+              $md += (Get-Content "$f.txt" -Raw).TrimEnd()
+              $md += '```'
+              $md += "</details>"
+            }
+          }
+          $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-output
+          path: schannel-sid-repro/*.txt
+          if-no-files-found: warn
+
+      - name: Remove the AppContainer profiles
+        if: always()
+        shell: pwsh
+        run: |
+          cd schannel-sid-repro
+          foreach ($n in 'tls-check','nuget-sandbox') {
+            & .\runappcontainer.exe --name $n --delete-profile 2>&1 | Write-Host
+          }
+          exit 0
