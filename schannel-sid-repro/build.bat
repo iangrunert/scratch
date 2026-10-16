@@ -12,8 +12,11 @@ if errorlevel 1 goto :fail
 cl %CFLAGS% runrestricted.c /link advapi32.lib
 if errorlevel 1 goto :fail
 
+cl %CFLAGS% runappcontainer.c /link userenv.lib advapi32.lib ole32.lib
+if errorlevel 1 goto :fail
+
 echo.
-echo Built schantest.exe and runrestricted.exe
+echo Built schantest.exe, runrestricted.exe and runappcontainer.exe
 goto :eof
 
 :fail
