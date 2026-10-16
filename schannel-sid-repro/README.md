@@ -240,41 +240,74 @@ it only if cold restores are genuinely too slow.
 
 ## Verified results
 
-From CI on `windows-latest` (run 1, commit `d480c5a`):
+From CI on `windows-latest`, run 4 (`ef77e50`), all steps green:
 
 - **AppContainer: all 14 probes pass.** `EnumerateSecurityPackages` saw 12
-  packages, `CertOpenSystemStore(ROOT)` saw 571 roots, `HKLM
-  SystemCertificates` 552 entries, the handshake negotiated TLS 1.2 with
-  AES-256 and ECDHE, `CertVerifyChainPolicy` trusted the chain, and
-  `EncryptMessage`/`DecryptMessage` moved a real HTTP request. The token dump
-  confirms `AppContainer: yes`, `Restricting SIDs: 0`, low integrity.
-  **SChannel works in a lowbox.**
-- **Restricting SID: still not demonstrated, for a different reason than
-  first thought.** The child exits `0xC0000135` (`STATUS_DLL_NOT_FOUND`) with
-  no output: under the RESTRICTED SID it cannot load a DLL in its own import
-  graph, so it never reaches `main`. Granting the window station and desktop
-  did not change this — that was a misdiagnosis of the same decimal exit code.
-  Practically this is a *stronger* argument against restricting SIDs for a
-  tool like `nuget.exe` (it cannot even start), but the specific mechanism
-  claimed earlier — SSPI being denied the LSASS ALPC port — remains unverified
-  by this harness, because no code runs to exercise it. Treat that mechanism
-  as reasoning, not as a measured result.
-- **NuGet: `-ConfigFile` is not enough.** `nuget.exe` reads the user-level
-  `%APPDATA%\NuGet\NuGet.Config` regardless, and the failure underneath is
-  *Access to the path 'C:\Users' is denied* — traverse denial on the profile
-  chain. Reaching any granted directory requires every ancestor to be
-  traversable, which is why `--grant-x` exists: a non-inheriting
-  execute-only ACE opens the path without opening the contents, and without
-  spreading into other users' profiles the way an inheritable grant on
-  `C:\Users` would.
+  packages, `CertOpenSystemStore(ROOT)` 571 roots, `HKLM SystemCertificates`
+  552 entries; the handshake negotiated TLS 1.2 with AES-256 and ECDHE,
+  `CertVerifyChainPolicy` trusted the chain, and `EncryptMessage` /
+  `DecryptMessage` moved a real HTTP request. The token dump confirms
+  `AppContainer: yes`, `Restricting SIDs: 0`, low integrity. **SChannel works
+  in a lowbox.**
 
-One caveat on how these were checked. The first run's assertions piped an
-`Out-String` blob to `Select-String` with a `^`-anchored pattern. That anchors
-at the start of the whole blob, so the per-line patterns never matched and the
-AppContainer check could not fail. The result above is trustworthy because the
-probe's own summary line and exit code say so, not because that assertion
-passed. The workflow now splits output into lines and cross-checks the exit
-code.
+- **`nuget.exe` works in the AppContainer, end to end.** It fetched
+  `newtonsoft.json.13.0.3.nupkg` from `api.nuget.org` over TLS and installed it
+  with a verified content hash. This is the actual claim this repo exists to
+  support, and it holds.
+
+- **Restricting SID: the premise is still not demonstrated.** The child exits
+  `0xC0000135` (`STATUS_DLL_NOT_FOUND`) with no output — under the RESTRICTED
+  SID it cannot load a DLL in its own import graph, so it never reaches
+  `main`. Practically this is a *stronger* reason to reject restricting SIDs
+  for a tool like `nuget.exe`: it cannot even start. But the mechanism claimed
+  elsewhere in this README — SSPI being denied the LSASS ALPC port — remains
+  **unverified**, because no code runs to exercise it. Treat it as reasoning,
+  not as a measured result. Demonstrating it needs a different experiment:
+  a binary whose imports the restricting SID *can* load.
+
+### AppContainer tokens do not get ancestor traverse for free
+
+The finding most likely to bite a real deployment. Reaching a granted
+directory requires **every ancestor to be traversable by the package SID**, and
+a lowbox token does not get this by default. `nuget.exe` failed with *Access to
+the path 'C:\Users' is denied* until the chain from the drive root down to
+`%APPDATA%` was opened with `--grant-x`.
+
+`--grant-x` is a non-inheriting `FILE_TRAVERSE` ACE: it opens the path without
+opening the contents, and without the spread an inheritable grant on
+`C:\Users` would cause across every profile. The working grant set for NuGet,
+as CI runs it:
+
+```
+--grant-x  C:\  C:\Users  C:\Users\<user>  ...\AppData  ...\AppData\Roaming
+--grant-ro %APPDATA%\NuGet          # nuget reads this whatever -ConfigFile says
+--grant-ro <tool dir>
+--grant-rw <output or solution dir>
+--nuget-state
+```
+
+The traverse ACE on `C:\` is redundant in practice (the root already allows
+it) but harmless, and keeping the walk uniform avoids special cases.
+
+Note that `-ConfigFile` does **not** stop `nuget.exe` reading the user-level
+`%APPDATA%\NuGet\NuGet.Config`, so that directory needs read access
+regardless.
+
+### On trusting these results
+
+Two bugs in earlier runs are worth knowing about, because both produced
+confident output that was wrong:
+
+1. The first run's assertions piped an `Out-String` blob to `Select-String`
+   with a `^`-anchored pattern. That anchors at the start of the whole blob, so
+   the per-line patterns never matched and the AppContainer check **could not
+   fail**. It now captures lines and cross-checks the exit code, so no single
+   text match is load-bearing.
+2. The restricted child's exit code `3221225781` was read as `0xC0000142`
+   (`STATUS_DLL_INIT_FAILED`) when it is `0xC0000135`
+   (`STATUS_DLL_NOT_FOUND`) — the decimal forms differ by 13. That sent a fix
+   after the window station, which was never the problem. The launcher now
+   prints hex plus the NTSTATUS name.
 
 ---
 
