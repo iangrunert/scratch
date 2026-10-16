@@ -95,16 +95,21 @@ jobs:
           # Select-String anchors ^ at the start of the whole blob, so the
           # per-line patterns below never match -- that bug made an earlier
           # run report the opposite of the truth.
-          $sspi    = @($out | Where-Object { $_ -match '^\[FAIL\]\s+[1-3]\.' })
-          $ranAny  = @($out | Where-Object { $_ -match '^\[(?: OK |FAIL|skip)\]' })
-          $verdict = if ($code -eq 3221225781) {
-            "Child died at DLL init (0xC0000142) -- window station/desktop DACL, not a TLS result."
+          $sspi   = @($out | Where-Object { $_ -match '^\[FAIL\]\s+[1-3]\.' })
+          $ranAny = @($out | Where-Object { $_ -match '^\[(?: OK |FAIL|skip)\]' })
+          # $LASTEXITCODE is Int32, so 0xC0000135 arrives as -1073741515.
+          # Mask to 32 bits before comparing against an NTSTATUS.
+          $status = $code -band 0xFFFFFFFF
+          $verdict = if ($status -eq 0xC0000135) {
+            "Child could not LOAD a DLL (0xC0000135 STATUS_DLL_NOT_FOUND). No code ran, so this says nothing about SSPI."
+          } elseif ($status -eq 0xC0000142) {
+            "Child died at DLL init (0xC0000142). No code ran, so this says nothing about SSPI."
           } elseif ($out -match 'CreateProcessAsUser\s+failed') {
             "Process could not start; image ACL problem, not a TLS result."
           } elseif ($sspi.Count -gt 0) {
             "SSPI unreachable under a restricting SID -- as predicted ($($sspi.Count) of probes 1-3 failed)."
           } elseif ($ranAny.Count -eq 0) {
-            "No probe output captured; the child produced nothing."
+            "No probe output captured; exit $code (0x$('{0:X8}' -f $status))."
           } else {
             "Probes 1-3 PASSED under a restricting SID -- the premise needs revisiting."
           }
@@ -171,8 +176,28 @@ jobs:
           </configuration>
           '@ | Set-Content -Path "$tools\NuGet.Config" -Encoding utf8
 
+          # -ConfigFile does not stop nuget.exe reading the user-level
+          # NuGet.Config, and the failure underneath is traverse denial on the
+          # profile chain. Open each ancestor with traverse only (not
+          # inheritable, so it does not spread into other profiles) and read on
+          # just the NuGet directory.
+          $appdata = [Environment]::GetFolderPath('ApplicationData')
+          $chain = @()
+          $cur = $appdata
+          while ($cur) {
+            $chain += $cur
+            $parent = Split-Path $cur -Parent
+            if (-not $parent -or $parent -eq $cur) { break }
+            $cur = $parent
+          }
+          $traverse = @()
+          foreach ($d in $chain) { $traverse += @('--grant-x', $d) }
+          $nugetCfgDir = Join-Path $appdata 'NuGet'
+          New-Item -ItemType Directory -Force -Path $nugetCfgDir | Out-Null
+
           $out = & .\runappcontainer.exe --name nuget-sandbox --internet --nuget-state `
                    --grant-ro $tools --grant-rw $outdir `
+                   @traverse --grant-ro $nugetCfgDir `
                    '--' "$tools\nuget.exe" install Newtonsoft.Json -Version 13.0.3 `
                       -OutputDirectory $outdir -ConfigFile "$tools\NuGet.Config" `
                       -NonInteractive 2>&1 | ForEach-Object { $_.ToString() }

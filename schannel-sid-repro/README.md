@@ -80,14 +80,17 @@ broken transport apart from a broken trust store. Run it both ways.
    looks nothing like a TLS problem. The launcher prints this hint when it sees
    that error.
 
-2. **Window station / desktop.** `runrestricted` now grants the restricting
-   SID access to the process window station and thread desktop before
-   launching, because without it the child dies at DLL init with
-   `0xC0000142` before executing a single instruction — no output, no probe
-   results, and a failure that looks like nothing at all. CI hit exactly this
-   on the first run. Chromium's sandbox solves it by handing the sandbox an
-   alternate desktop; widening the existing one is enough for a diagnostic,
-   but it is a real reason this launcher is a diagnostic and not a sandbox.
+2. **The child may not start at all.** `runrestricted` grants the restricting
+   SID access to the window station and thread desktop, since a lowbox or
+   restricted child can die at DLL *initialisation* (`0xC0000142`) without
+   that. But on the CI runner the actual failure is one step earlier:
+   `0xC0000135` `STATUS_DLL_NOT_FOUND`, meaning the restricting SID is absent
+   from the DACL of some DLL in the import graph, so loading fails before any
+   code runs. Both statuses mean the same thing for interpretation: **no code
+   ran, so the output says nothing about SSPI either way.** The launcher now
+   prints the status in hex with its name, because the decimal forms are easy
+   to confuse — `0xC0000135` is 3221225781 and `0xC0000142` is 3221225794, and
+   mistaking one for the other sends you after the wrong cause.
 
 ## Reading the output
 
@@ -246,16 +249,24 @@ From CI on `windows-latest` (run 1, commit `d480c5a`):
   `EncryptMessage`/`DecryptMessage` moved a real HTTP request. The token dump
   confirms `AppContainer: yes`, `Restricting SIDs: 0`, low integrity.
   **SChannel works in a lowbox.**
-- **Restricting SID: not yet demonstrated.** The child exited `0xC0000142`
-  with no output — the window station problem above, since fixed. The claim
-  that restricting SIDs break SSPI is still reasoning plus documentation, not
-  evidence from this repo.
-- **NuGet: needs its config pinned.** Left alone it walks the directory tree
-  looking for `NuGet.Config` and fails with *Access to the path 'C:\Users' is
-  denied* — the walk itself wants read access to ancestors that should not be
-  granted. Passing `-ConfigFile` with a config inside an already-granted
-  directory removes the need for the hole rather than opening one. This is the
-  general lesson for sandboxing a tool: pin its config, do not let it search.
+- **Restricting SID: still not demonstrated, for a different reason than
+  first thought.** The child exits `0xC0000135` (`STATUS_DLL_NOT_FOUND`) with
+  no output: under the RESTRICTED SID it cannot load a DLL in its own import
+  graph, so it never reaches `main`. Granting the window station and desktop
+  did not change this — that was a misdiagnosis of the same decimal exit code.
+  Practically this is a *stronger* argument against restricting SIDs for a
+  tool like `nuget.exe` (it cannot even start), but the specific mechanism
+  claimed earlier — SSPI being denied the LSASS ALPC port — remains unverified
+  by this harness, because no code runs to exercise it. Treat that mechanism
+  as reasoning, not as a measured result.
+- **NuGet: `-ConfigFile` is not enough.** `nuget.exe` reads the user-level
+  `%APPDATA%\NuGet\NuGet.Config` regardless, and the failure underneath is
+  *Access to the path 'C:\Users' is denied* — traverse denial on the profile
+  chain. Reaching any granted directory requires every ancestor to be
+  traversable, which is why `--grant-x` exists: a non-inheriting
+  execute-only ACE opens the path without opening the contents, and without
+  spreading into other users' profiles the way an inheritable grant on
+  `C:\Users` would.
 
 One caveat on how these were checked. The first run's assertions piped an
 `Out-String` blob to `Select-String` with a `^`-anchored pattern. That anchors

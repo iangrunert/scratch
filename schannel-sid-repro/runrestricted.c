@@ -187,6 +187,21 @@ static void grant_station_and_desktop(PSID sid)
     }
 }
 
+/* The handful of NTSTATUS values a sandboxed child actually dies of before
+   main() runs. Decoded here because the decimal forms are easy to confuse:
+   0xC0000135 is 3221225781 and 0xC0000142 is 3221225794. */
+static const char *ntstatus_name(DWORD s)
+{
+    switch (s) {
+    case 0xC0000135: return "STATUS_DLL_NOT_FOUND";
+    case 0xC0000142: return "STATUS_DLL_INIT_FAILED";
+    case 0xC0000022: return "STATUS_ACCESS_DENIED";
+    case 0xC0000017: return "STATUS_NO_MEMORY";
+    case 0xC000007B: return "STATUS_INVALID_IMAGE_FORMAT";
+    default:         return NULL;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const wchar_t *restrict_sid = L"S-1-5-12";   /* RESTRICTED */
@@ -281,11 +296,21 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("\n  child exit code: %lu", (unsigned long)exit_code);
-    if (exit_code == 0xC0000142)
-        printf("  (DLL init failed -- usually the window station/desktop DACL,\n"
-               "   see the note in README.md)");
-    printf("\n");
+    {
+        const char *nt = ntstatus_name(exit_code);
+        printf("\n  child exit code: %lu (0x%08lX)",
+               (unsigned long)exit_code, (unsigned long)exit_code);
+        if (nt)
+            printf("  %s", nt);
+        printf("\n");
+        if (exit_code == 0xC0000135)
+            printf("  The child could not LOAD a DLL in its import graph: the\n"
+                   "  restricting SID is absent from some system DLL's DACL. No\n"
+                   "  code ran, so this says nothing about SSPI either way.\n");
+        else if (exit_code == 0xC0000142)
+            printf("  A DLL failed to INITIALISE -- typically the window\n"
+                   "  station or desktop DACL. No code ran.\n");
+    }
     rc = (int)exit_code;
 
 out:

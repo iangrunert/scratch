@@ -30,6 +30,7 @@
  *   --no-internet      drop internetClient
  *   --grant-ro <path>  grant the package SID read+execute, inheritable
  *   --grant-rw <path>  grant the package SID modify, inheritable
+ *   --grant-x <path>   grant traverse only, not inherited (for ancestors)
  *   --nuget-state      point NUGET_PACKAGES / caches / TEMP at the profile dir
  *   --show-sid         print the package SID and exit
  *   --delete-profile   delete the profile and exit
@@ -60,9 +61,14 @@
 #define CAP_INTERNET_CLIENT   L"S-1-15-3-1"
 #define CAP_PRIVATE_NETWORK   L"S-1-15-3-3"
 
+/* mode: 0 = read+execute, 1 = modify, 2 = traverse only.
+   Traverse exists because reaching a granted directory means every ancestor
+   must be traversable, and an inheritable grant on something like C:\Users
+   would propagate into every user's profile. A non-inheriting execute-only
+   ACE opens the path without opening the contents. */
 typedef struct {
     wchar_t path[MAX_PATH];
-    int     writable;
+    int     mode;
 } grant;
 
 static void usage(void)
@@ -75,6 +81,7 @@ static void usage(void)
       "  --private-net       grant privateNetworkClientServer\n"
       "  --grant-ro <path>   package SID gets read+execute, inheritable\n"
       "  --grant-rw <path>   package SID gets modify, inheritable\n"
+      "  --grant-x <path>    package SID gets traverse only, not inherited\n"
       "  --nuget-state       redirect NuGet caches and TEMP into the profile\n"
       "  --show-sid          print the package SID and exit\n"
       "  --delete-profile    delete the profile and exit\n");
@@ -114,7 +121,7 @@ static PSID ensure_profile(const wchar_t *name)
    already on the object. SetEntriesInAcl merges rather than replaces, so this
    is additive and idempotent -- re-running does not stack duplicates in any
    way that changes the effective rights. */
-static int grant_path(const wchar_t *path, PSID sid, int writable)
+static int grant_path(const wchar_t *path, PSID sid, int mode)
 {
     PACL old_dacl = NULL, new_dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
@@ -131,11 +138,15 @@ static int grant_path(const wchar_t *path, PSID sid, int writable)
     }
 
     memset(&ea, 0, sizeof ea);
-    ea.grfAccessPermissions = writable
-        ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE)
-        : (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE);
+    ea.grfAccessPermissions =
+        mode == 1 ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+                     FILE_GENERIC_EXECUTE | DELETE) :
+        mode == 2 ? FILE_TRAVERSE :
+                    (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE);
     ea.grfAccessMode = GRANT_ACCESS;
-    ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    /* Traverse must not be inherited, or it spreads to every child. */
+    ea.grfInheritance = mode == 2 ? NO_PROPAGATE_INHERIT_ACE
+                                  : SUB_CONTAINERS_AND_OBJECTS_INHERIT;
     ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     ea.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
     ea.Trustee.ptstrName = (LPWSTR)sid;
@@ -158,7 +169,8 @@ static int grant_path(const wchar_t *path, PSID sid, int writable)
         return 0;
     }
 
-    printf("  granted %-3s              %ls\n", writable ? "rw" : "ro", path);
+    printf("  granted %-3s              %ls\n",
+           mode == 1 ? "rw" : mode == 2 ? "x" : "ro", path);
     LocalFree(new_dacl);
     LocalFree(sd);
     return 1;
@@ -286,12 +298,14 @@ int main(int argc, char **argv)
             name = name_buf;
         }
         else if ((strcmp(argv[i], "--grant-ro") == 0 ||
-                  strcmp(argv[i], "--grant-rw") == 0) && i + 1 < argc) {
+                  strcmp(argv[i], "--grant-rw") == 0 ||
+                  strcmp(argv[i], "--grant-x") == 0) && i + 1 < argc) {
             if (grant_count >= MAX_GRANTS) {
                 printf("  too many grants (max %d)\n", MAX_GRANTS);
                 return 2;
             }
-            grants[grant_count].writable = (argv[i][9] == 'w');
+            grants[grant_count].mode = argv[i][8] == 'x' ? 2
+                                     : argv[i][9] == 'w' ? 1 : 0;
             MultiByteToWideChar(CP_UTF8, 0, argv[++i], -1,
                                 grants[grant_count].path, MAX_PATH);
             grants[grant_count].path[MAX_PATH - 1] = L'\0';
@@ -349,7 +363,7 @@ int main(int argc, char **argv)
         printf("  capability               none (no network)\n");
 
     for (int i = 0; i < grant_count; i++) {
-        if (!grant_path(grants[i].path, sid, grants[i].writable))
+        if (!grant_path(grants[i].path, sid, grants[i].mode))
             goto out;
     }
 
