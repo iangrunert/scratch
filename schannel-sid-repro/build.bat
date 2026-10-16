@@ -9,7 +9,7 @@ set CFLAGS=/nologo /W4 /O2 /D_CRT_SECURE_NO_WARNINGS
 cl %CFLAGS% schantest.c /link secur32.lib crypt32.lib ws2_32.lib advapi32.lib
 if errorlevel 1 goto :fail
 
-cl %CFLAGS% runrestricted.c childio.c /link advapi32.lib
+cl %CFLAGS% runrestricted.c childio.c /link advapi32.lib user32.lib
 if errorlevel 1 goto :fail
 
 cl %CFLAGS% runappcontainer.c childio.c /link userenv.lib advapi32.lib ole32.lib

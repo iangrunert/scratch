@@ -231,7 +231,12 @@ jobs:
         shell: pwsh
         run: |
           cd schannel-sid-repro
+          if (-not (Test-Path .\runappcontainer.exe)) {
+            Write-Host "No launcher built; nothing to clean up."
+            exit 0
+          }
           foreach ($n in 'tls-check','nuget-sandbox') {
-            & .\runappcontainer.exe --name $n --delete-profile 2>&1 | Write-Host
+            try   { & .\runappcontainer.exe --name $n --delete-profile 2>&1 | Write-Host }
+            catch { Write-Host "Could not delete profile ${n}: $_" }
           }
           exit 0

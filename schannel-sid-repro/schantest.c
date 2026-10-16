@@ -327,11 +327,11 @@ static int probe_dns(const wchar_t *host, const char *port, struct addrinfo **ou
         return 0;
     }
     {
-        char ip[INET6_ADDRSTRLEN] = "?";
         struct addrinfo *ai = *out;
-        DWORD len = sizeof ip;
-        WSAAddressToStringA(ai->ai_addr, (DWORD)ai->ai_addrlen, NULL, ip, &len);
-        pass("getaddrinfo", "%s -> %s", hostA, ip);
+        char ip[INET6_ADDRSTRLEN] = "?", svc[16] = "?";
+        getnameinfo(ai->ai_addr, (socklen_t)ai->ai_addrlen, ip, sizeof ip,
+                    svc, sizeof svc, NI_NUMERICHOST | NI_NUMERICSERV);
+        pass("getaddrinfo", "%s -> %s:%s", hostA, ip, svc);
     }
     return 1;
 }
