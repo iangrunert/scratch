@@ -175,6 +175,29 @@ Invoke-Mxc 'bb-sh-spawn-native' "$bb\busybox.exe sh -c `"cmd.exe /c echo native-
 Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx-outside/bb.txt`"" -Expect fail -Ui
 Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-sh-exe' -Ui
 
+# busybox wget/ssl_client over HTTPS. busybox64a/64u use Schannel; busybox64
+# uses busybox's own TLS, which does not check certificates.
+$bbHttps = [ordered]@{
+    'bb-wget-https-valid'      = @('https://github.com/robots.txt', 'User-agent', 'pass')
+    'bb-wget-https-self-signed' = @('https://self-signed.badssl.com/', '', 'fail')
+    'bb-wget-https-wrong-host' = @('https://wrong.host.badssl.com/', '', 'fail')
+    'bb-wget-https-expired'    = @('https://expired.badssl.com/', '', 'fail')
+}
+foreach ($name in $bbHttps.Keys) {
+    $url, $want, $expect = $bbHttps[$name]
+    $hostOut = & "$bb\busybox.exe" wget -q -O - $url 2>&1 | Out-String
+    $results.Add([pscustomobject]@{ Name = "host-$name"; Expect = 'info'; Exit = $LASTEXITCODE; Ok = $true
+        Tail = (($hostOut.Trim() -split "`n" | Select-Object -Last 2) -join ' / ').Replace('|', '/') })
+    foreach ($lb in $false, $true) {
+        $n = if ($lb) { "$name-loopback" } else { $name }
+        $splat = @{ Expect = $expect; Network = $true; HostLoopback = $lb; Ui = $true }
+        if ($want) { $splat.MustContain = $want }
+        # Keep wget's exit status but end on a builtin so its output is not lost.
+        Invoke-Mxc $n "$bb\busybox.exe sh -c `"wget -q -O - $url; rc=`$?; echo end=`$rc; exit `$rc`"" @splat
+    }
+}
+Invoke-Mxc 'bb-wget-https-self-signed-no-check' "$bb\busybox.exe sh -c `"wget -q --no-check-certificate -O - https://self-signed.badssl.com/; rc=`$?; echo end=`$rc; exit `$rc`"" -Expect info -Network -HostLoopback -Ui
+
 # --- git ---------------------------------------------------------------------
 if ($haveGit) {
     $g = "$gitBin\git.exe"
