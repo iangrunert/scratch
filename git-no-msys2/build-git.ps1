@@ -33,7 +33,9 @@ foreach ($p in 'sh','sed','git','perl','bash') {
     $c = Get-Command $p -ErrorAction SilentlyContinue
     Write-Host ("{0,-5} -> {1}" -f $p, ($c.Source ?? '<not found>'))
 }
-if (Get-Command bash -ErrorAction SilentlyContinue) { throw 'bash is still reachable' }
+# C:\Windows\System32\bash.exe is the WSL launcher, not MSYS2.
+$bash = (Get-Command bash -ErrorAction SilentlyContinue).Source
+if ($bash -and $bash -notmatch '(?i)\\Windows\\system32\\') { throw "MSYS2-style bash still reachable: $bash" }
 
 Push-Location $Source
 try {
