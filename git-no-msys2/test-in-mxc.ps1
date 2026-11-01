@@ -35,6 +35,7 @@ function Invoke-Mxc {
         [ValidateSet('pass','fail','info')] [string] $Expect = 'pass',
         [string] $MustContain,
         [switch] $Network,
+        [switch] $HostLoopback,
         [switch] $Ui,
         [string] $Cwd = $work
     )
@@ -56,11 +57,17 @@ function Invoke-Mxc {
             )
         }
         filesystem  = [ordered]@{
-            readonlyPaths  = @($bb) + $(if ($haveGit) { @($git) } else { @() })
+            readonlyPaths  = @(@($bb) + $(if ($haveGit) { @($git) } else { @() }) | Where-Object { -not $_.StartsWith("$work\") })
             readwritePaths = @($work)
         }
     }
-    if ($Network) { $req.processContainer = @{ capabilities = @('internetClient') } }
+    if ($Network) {
+        $req.processContainer = @{ capabilities = @('internetClient') }
+        $req.network = [ordered]@{
+            egress  = @{ default = 'allow' }
+            ingress = [ordered]@{ default = 'deny'; hostLoopback = $(if ($HostLoopback) { 'allow' } else { 'deny' }) }
+        }
+    }
     # busybox-w32 links user32; its DLL init fails when Win32k is blocked (the default).
     if ($Ui) { $req.ui = @{ disable = $false } }
     $cfg = Join-Path $OutDir "$Name.json"
@@ -110,6 +117,25 @@ Invoke-Mxc 'baseline-cmd' 'cmd.exe /c echo hello-from-container' -MustContain 'h
 Invoke-Mxc 'containment-write-outside' "cmd.exe /c echo x> $outside\pwned.txt" -Expect fail
 Invoke-Mxc 'containment-read-outside' "cmd.exe /c type $outside\secret.txt" -Expect info
 
+# --- Executing tools from inside the container ----------------------------
+# wxc-exec starts the top-level process itself; children are started by the
+# contained process. Check whether a contained process may execute files from
+# a readonlyPaths grant and from a readwritePaths grant.
+New-Item -ItemType Directory -Force "$work\tools\bb" | Out-Null
+Copy-Item "$bb\busybox.exe", "$bb\sh.exe" "$work\tools\bb"
+Invoke-Mxc 'exec-child-from-readonly-path'  "cmd.exe /c $bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
+Invoke-Mxc 'exec-child-from-readwrite-path' "cmd.exe /c $work\tools\bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
+$roExec = ($results | Where-Object Name -eq 'exec-child-from-readonly-path').Exit -eq 0
+$rwExec = ($results | Where-Object Name -eq 'exec-child-from-readwrite-path').Exit -eq 0
+Write-Host "child exec from readonlyPaths: $roExec; from readwritePaths: $rwExec"
+if (-not $roExec -and $rwExec) {
+    # Run the remaining cases with the tools in the writable workspace, so the
+    # results show what git and busybox do once they can start each other.
+    Write-Host '::warning::Contained processes cannot execute files under readonlyPaths; relocating busybox and git into the readwrite workspace.'
+    $bb = "$work\tools\bb"
+    if ($haveGit) { Copy-Item -Recurse $git "$work\tools\git"; $git = "$work\tools\git" }
+}
+
 # --- busybox-w32 ------------------------------------------------------------
 Invoke-Mxc 'bb-default-ui-policy' "$bb\busybox.exe --help" -Expect info
 Invoke-Mxc 'bb-version'   "$bb\busybox.exe --help" -MustContain 'BusyBox' -Ui
@@ -150,6 +176,7 @@ if ($haveGit) {
     Invoke-Mxc 'git-submodule-sh-wrapper' "$bb\sh.exe -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status`"" -MustContain ' sub' -Ui
     Invoke-Mxc 'git-https-ls-remote' "$g ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network -Ui:$gitUi
     Invoke-Mxc 'git-https-ls-remote-schannel' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network -Ui:$gitUi
+    Invoke-Mxc 'git-https-ls-remote-schannel-loopback' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network -HostLoopback -Ui:$gitUi
 }
 
 # --- Report -----------------------------------------------------------------
