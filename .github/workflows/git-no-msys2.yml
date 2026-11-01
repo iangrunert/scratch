@@ -146,7 +146,7 @@ jobs:
           path: ${{ runner.temp }}/mxc
       - name: Fetch busybox-w32
         shell: pwsh
-        run: Invoke-WebRequest $env:BUSYBOX_URL -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
+        run: Invoke-WebRequest $env:BUSYBOX_URL -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe') -MaximumRetryCount 5 -RetryIntervalSec 10
       - name: Run git and busybox inside ProcessContainer
         shell: pwsh
         run: >

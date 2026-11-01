@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 
 $tools = Join-Path $env:RUNNER_TEMP 'bbtools'
 New-Item -ItemType Directory -Force $tools | Out-Null
-Invoke-WebRequest $BusyboxUrl -OutFile (Join-Path $tools 'busybox.exe')
+Invoke-WebRequest $BusyboxUrl -OutFile (Join-Path $tools 'busybox.exe') -MaximumRetryCount 5 -RetryIntervalSec 10
 # Meson looks these up by name; busybox-w32 picks the applet from argv[0].
 foreach ($t in 'sh','sed','diff','tar','cat','cut','grep','sort','tr','uname','awk','mkdir','rm','cp','mv','ls','find','xargs','head','tail','wc','test','expr','printf','echo','touch','basename','dirname') {
     Copy-Item (Join-Path $tools 'busybox.exe') (Join-Path $tools "$t.exe")
