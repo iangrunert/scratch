@@ -16,8 +16,8 @@ $sbx  = 'C:\sbx'
 $bb   = "$sbx\bb"
 $work = "$sbx\work"
 $git  = "$sbx\git"
-$outside = "$sbx\outside"
-Remove-Item -Recurse -Force $sbx -ErrorAction SilentlyContinue
+$outside = "C:\sbx-outside"   # deliberately not under $sbx
+Remove-Item -Recurse -Force $sbx, $outside -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $bb, $work, "$work\home", "$work\tmp", $outside | Out-Null
 Copy-Item $BusyboxExe "$bb\busybox.exe"
 Copy-Item $BusyboxExe "$bb\sh.exe"     # git looks up "sh" on PATH
@@ -36,6 +36,7 @@ function Invoke-Mxc {
         [string] $MustContain,
         [switch] $Network,
         [switch] $HostLoopback,
+        [string[]] $ExtraReadonly = @(),
         [switch] $Ui,
         [string] $Cwd = $work
     )
@@ -57,7 +58,8 @@ function Invoke-Mxc {
             )
         }
         filesystem  = [ordered]@{
-            readonlyPaths  = @(@($bb) + $(if ($haveGit) { @($git) } else { @() }) | Where-Object { -not $_.StartsWith("$work\") })
+            readonlyPaths  = @(@($bb) + $(if ($haveGit) { @($git) } else { @() }) + $ExtraReadonly + $script:ParentGrant |
+                               Where-Object { $_ -and -not $_.StartsWith("$work\") } | Select-Object -Unique)
             readwritePaths = @($work)
         }
     }
@@ -119,21 +121,21 @@ Invoke-Mxc 'containment-read-outside' "cmd.exe /c type $outside\secret.txt" -Exp
 
 # --- Executing tools from inside the container ----------------------------
 # wxc-exec starts the top-level process itself; children are started by the
-# contained process. Check whether a contained process may execute files from
-# a readonlyPaths grant and from a readwritePaths grant.
+# contained process. Find out what a contained process needs to start a
+# binary from a readonlyPaths or readwritePaths grant.
+$script:ParentGrant = @()
 New-Item -ItemType Directory -Force "$work\tools\bb" | Out-Null
 Copy-Item "$bb\busybox.exe", "$bb\sh.exe" "$work\tools\bb"
-Invoke-Mxc 'exec-child-from-readonly-path'  "cmd.exe /c $bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
-Invoke-Mxc 'exec-child-from-readwrite-path' "cmd.exe /c $work\tools\bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
-$roExec = ($results | Where-Object Name -eq 'exec-child-from-readonly-path').Exit -eq 0
-$rwExec = ($results | Where-Object Name -eq 'exec-child-from-readwrite-path').Exit -eq 0
-Write-Host "child exec from readonlyPaths: $roExec; from readwritePaths: $rwExec"
-if (-not $roExec -and $rwExec) {
-    # Run the remaining cases with the tools in the writable workspace, so the
-    # results show what git and busybox do once they can start each other.
-    Write-Host '::warning::Contained processes cannot execute files under readonlyPaths; relocating busybox and git into the readwrite workspace.'
-    $bb = "$work\tools\bb"
-    if ($haveGit) { Copy-Item -Recurse $git "$work\tools\git"; $git = "$work\tools\git" }
+Invoke-Mxc 'exec-cmd-child-system32'        "cmd.exe /c whoami.exe" -Expect info -Ui
+Invoke-Mxc 'exec-cmd-child-readonly'        "cmd.exe /c $bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
+Invoke-Mxc 'exec-cmd-child-readwrite'       "cmd.exe /c $work\tools\bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui
+Invoke-Mxc 'exec-bb-child-readonly'         "$bb\busybox.exe sh -c `"$($bb -replace '\\','/')/busybox.exe echo child-ran`"" -Expect info -MustContain 'child-ran' -Ui
+Invoke-Mxc 'exec-bb-child-readwrite'        "$bb\busybox.exe sh -c `"$($work -replace '\\','/')/tools/bb/busybox.exe echo child-ran`"" -Expect info -MustContain 'child-ran' -Ui
+Invoke-Mxc 'exec-cmd-child-readonly-parent-granted' "cmd.exe /c $bb\busybox.exe echo child-ran" -Expect info -MustContain 'child-ran' -Ui -ExtraReadonly $sbx
+$ok = { param($n) [bool]($results | Where-Object { $_.Name -eq $n -and $_.Exit -eq 0 }) }
+if (-not (& $ok 'exec-cmd-child-readonly') -and (& $ok 'exec-cmd-child-readonly-parent-granted')) {
+    Write-Host '::warning::Contained cmd.exe could start a granted binary only after the parent C:\sbx was also granted read-only; granting it for the remaining cases.'
+    $script:ParentGrant = @($sbx)
 }
 
 # --- busybox-w32 ------------------------------------------------------------
@@ -144,7 +146,7 @@ Invoke-Mxc 'bb-sh-pipes'  "$bb\busybox.exe sh -c `"seq 1 100 | awk '{s+=`$1} END
 Invoke-Mxc 'bb-sh-files'  "$bb\busybox.exe sh -c `"mkdir -p d && echo abc > d/f && cat d/f | tr a-z A-Z && ls -l d && rm -r d`"" -MustContain 'ABC' -Ui
 Invoke-Mxc 'bb-sh-subshell-func' "$bb\busybox.exe sh -c `"f() { echo fn:`$1; }; (f sub); x=`$(f cmd); echo `$x; for i in 1 2 3; do echo it`$i; done`"" -MustContain 'it3' -Ui
 Invoke-Mxc 'bb-sh-spawn-native' "$bb\busybox.exe sh -c `"cmd.exe /c echo native-child; echo rc=`$?`"" -MustContain 'native-child' -Ui
-Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx/outside/bb.txt`"" -Expect fail -Ui
+Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx-outside/bb.txt`"" -Expect fail -Ui
 Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-sh-exe' -Ui
 
 # --- native git -------------------------------------------------------------
