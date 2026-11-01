@@ -239,6 +239,15 @@ if ($haveGit) {
     Invoke-Mxc 'git-switch-master'  "$g -C r1 switch -q master" -Ui:$gitUi
     Invoke-Mxc 'git-merge'          "$g -C r1 merge -q --no-ff -m merged topic" -Ui:$gitUi
     Invoke-Mxc 'git-log'            "$g -C r1 log --graph --oneline" -MustContain 'merged' -Ui:$gitUi
+
+    # git started from PowerShell and cmd.exe inside the container.
+    $ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $pwsh7Dir = 'C:\Program Files\PowerShell\7'
+    $psScript = "Set-Location C:\sbx\work\r1; & '$g' --version; & '$g' log --oneline -1; `$LASTEXITCODE"
+    Invoke-Mxc 'ps51-starts-git' "$ps51 -NoProfile -NonInteractive -Command `"$psScript`"" -Expect info -MustContain 'merged' -Ui:$gitUi
+    Invoke-Mxc 'pwsh7-starts-git' "`"$pwsh7Dir\pwsh.exe`" -NoProfile -NonInteractive -Command `"$psScript`"" -Expect info -MustContain 'merged' -ExtraReadonly $pwsh7Dir -Ui:$gitUi
+    Invoke-Mxc 'ps51-starts-sh' "$ps51 -NoProfile -NonInteractive -Command `"& '$sh' -c 'echo from-sh; exit 0'; `$LASTEXITCODE`"" -Expect info -MustContain 'from-sh' -Ui:$shUi
+    Invoke-Mxc 'cmd-starts-git' "cmd.exe /c `"$g --version`"" -Expect info -MustContain 'git version' -Ui:$gitUi
     Invoke-Mxc 'git-clone-no-local' "$g clone -q --no-local r1 r2" -Ui:$gitUi
     Invoke-Mxc 'git-gc'             "$g -C r2 gc" -Ui:$gitUi
     Invoke-Mxc 'git-fsck'           "$g -C r2 fsck" -Ui:$gitUi
