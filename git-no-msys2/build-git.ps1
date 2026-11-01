@@ -96,8 +96,14 @@ try {
         $text = [IO.File]::ReadAllText($_.FullName)
         if ($text -match '^#!(\S+)') {
             Write-Host "shebang $($_.Name): #!$($Matches[1]) -> #!/bin/sh"
-            [IO.File]::WriteAllText($_.FullName, ($text -replace '^#!\S+', '#!/bin/sh'))
+            $text = $text -replace '^#!\S+', '#!/bin/sh'
         }
+        # The same path is substituted for @SHELL_PATH@ in script bodies
+        # (git-filter-branch runs "$SHELL_PATH" -c ...).
+        foreach ($p in @("$tools\sh.exe", (($tools -replace '\\', '/') + '/sh.exe'))) {
+            if ($text.Contains($p)) { Write-Host "SHELL_PATH in $($_.Name): $p -> sh"; $text = $text.Replace($p, 'sh') }
+        }
+        [IO.File]::WriteAllText($_.FullName, $text)
     }
 } finally {
     Pop-Location

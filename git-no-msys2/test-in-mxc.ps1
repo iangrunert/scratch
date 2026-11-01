@@ -56,6 +56,7 @@ function Invoke-Mxc {
                 'GIT_CONFIG_NOSYSTEM=1', 'GIT_AUTHOR_NAME=mxc', 'GIT_AUTHOR_EMAIL=mxc@example.com',
                 # Every launch is a new container identity, so files created by
                 # an earlier launch fail git's ownership check.
+                'GIT_PAGER=cat', 'PAGER=cat',
                 'GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=safe.directory', 'GIT_CONFIG_VALUE_0=*',
                 'GIT_COMMITTER_NAME=mxc', 'GIT_COMMITTER_EMAIL=mxc@example.com'
             )
@@ -178,20 +179,30 @@ if ($haveGit) {
     Invoke-Mxc 'git-https-ls-remote-schannel-loopback' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -MustContain 'refs/heads/master' -Network -HostLoopback -Ui:$gitUi
 
     # busybox sh driving git, and git starting busybox sh (needs Win32k for busybox).
+    # Output of the last external command in "sh -c" went missing in earlier runs.
+    # Compare inside vs outside the container, and with a trailing builtin.
+    $savedPath = $env:PATH; $env:PATH = "$git\bin;$bb;$env:SystemRoot\System32;$env:SystemRoot"
+    $hostOut = & $sh -c 'cd C:/sbx; git --version' 2>&1 | Out-String
+    $env:PATH = $savedPath
+    Write-Host "host (no container) sh -c 'git --version' => [$($hostOut.Trim())]"
+    $results.Add([pscustomobject]@{ Name = 'host-sh-last-external-output'; Expect = 'info'; Exit = $LASTEXITCODE; Ok = $true; Tail = $hostOut.Trim() })
+    Invoke-Mxc 'sh-last-external-output'   "$sh -c `"git --version`"" -Expect info -MustContain 'git version' -Ui
+    Invoke-Mxc 'sh-last-builtin-output'    "$sh -c `"git --version; echo end`"" -Expect info -MustContain 'git version' -Ui
+    Invoke-Mxc 'sh-last-external-native'   "$sh -c `"cmd.exe /c echo from-cmd`"" -Expect info -MustContain 'from-cmd' -Ui
     Invoke-Mxc 'sh-starts-git'      "$sh -c `"git --version; echo rc=`$?`"" -MustContain 'rc=0' -Ui
     Invoke-Mxc 'sh-edit-diff-commit' ("$sh -c `"cd r1 && echo hello > a.txt && git add a.txt && git commit -q -m add-a && echo more >> a.txt && " +
-        "git diff --stat && git commit -q -am more && git log --oneline -3`"") -MustContain 'more' -Ui
-    Invoke-Mxc 'sh-stash'           "$sh -c `"cd r1 && echo w >> a.txt && git stash -q && git stash list && git stash pop -q && git checkout -q -- . && git status --short`"" -MustContain 'stash@' -Ui
+        "git diff --stat && git commit -q -am more && git log --oneline -3; echo end=`$?`"") -MustContain 'more' -Ui
+    Invoke-Mxc 'sh-stash'           "$sh -c `"cd r1 && echo w >> a.txt && git stash -q && git stash list && git stash pop -q && git checkout -q -- . && git status --short; echo end=`$?`"" -MustContain 'stash@' -Ui
     Invoke-Mxc 'git-config-shell-alias' "$g -C r1 config alias.hi `"!echo alias-ran-in-sh `$((1+1))`"" -Ui:$gitUi
     Invoke-Mxc 'git-shell-alias'    "$g -C r1 hi" -MustContain 'alias-ran-in-sh 2' -Ui
     Invoke-Mxc 'git-hook' ("$sh -c `"cd r1 && printf '#!/bin/sh\necho hook-ran-from-busybox\n' > .git/hooks/pre-commit && " +
-        "git commit -q --allow-empty -m hooked`"") -MustContain 'hook-ran-from-busybox' -Ui
+        "git commit -q --allow-empty -m hooked; echo end=`$?`"") -MustContain 'hook-ran-from-busybox' -Ui
     Invoke-Mxc 'git-sequence-editor' ("$sh -c `"cd r1 && GIT_SEQUENCE_EDITOR='sed -i 1s/^pick/reword/' GIT_EDITOR='sed -i 1s/.*/reworded-by-sed/' " +
-        "git rebase -q -i HEAD~1 && git log -1 --format=%s`"") -MustContain 'reworded-by-sed' -Ui
-    Invoke-Mxc 'git-difftool-extcmd' "$sh -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~3 HEAD -- a.txt`"" -MustContain 'more' -Ui
+        "git rebase -q -i HEAD~1 && git log -1 --format=%s; echo end=`$?`"") -MustContain 'reworded-by-sed' -Ui
+    Invoke-Mxc 'git-difftool-extcmd' "$sh -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~3 HEAD -- a.txt; echo end=`$?`"" -MustContain 'more' -Ui
     Invoke-Mxc 'git-sh-setup'       "$sh -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui
-    Invoke-Mxc 'git-filter-branch'  "$sh -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s`"" -MustContain 'fb:' -Ui
-    Invoke-Mxc 'git-submodule'      "$sh -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status`"" -MustContain ' sub' -Ui
+    Invoke-Mxc 'git-filter-branch'  "$sh -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s; echo end=`$?`"" -MustContain 'fb:' -Ui
+    Invoke-Mxc 'git-submodule'      "$sh -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status; echo end=`$?`"" -MustContain ' sub' -Ui
 }
 
 # --- Report -----------------------------------------------------------------
