@@ -53,26 +53,29 @@ try {
     if ($LASTEXITCODE) { throw "meson compile failed ($LASTEXITCODE)" }
     meson install -C build --no-rebuild
     if ($LASTEXITCODE) { throw "meson install failed ($LASTEXITCODE)" }
-    # Meson installs dashed builtins (git-upload-pack.exe, ...) as links, some of
-    # which do not resolve on Windows; replace them with real files.
-    $gitExe = Join-Path $Prefix 'bin\git.exe'
+    # Meson's Windows install leaves bin\git and the dashed builtins in
+    # libexec\git-core as symlinks to extensionless names (e.g. "git"), which do
+    # not resolve. Replace each with a real <name>.exe copy of its target.
+    # Links can point at other links, so resolve in passes.
     $fixed = 0
-    Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType } | ForEach-Object {
+    foreach ($pass in 1..4) {
+    $links = @(Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType -eq 'SymbolicLink' })
+    if (-not $links) { break }
+    $links | ForEach-Object {
         $p = $_.FullName
-        if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or $_.LinkType -eq 'SymbolicLink') {
-            $target = $_.Target | Select-Object -First 1
-            $src = $gitExe
-            if ($target) {
-                $abs = if ([IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Split-Path $p) $target }
-                if (Test-Path -LiteralPath $abs -PathType Leaf) { $src = (Resolve-Path -LiteralPath $abs).Path }
-            }
-            Write-Host "link $p -> $target (copying $src)"
-            $tmp = "$p.tmp"
-            Copy-Item -LiteralPath $src $tmp
-            Remove-Item -LiteralPath $p -Force
-            Move-Item $tmp $p
-            $fixed++
+        $target = $_.Target | Select-Object -First 1
+        $abs = if ([IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Split-Path $p) $target }
+        $src = @($abs, "$abs.exe") | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+        if (-not $src) {
+            if ($pass -eq 4) { throw "cannot resolve link $p -> $target" }
+            return
         }
+        $dest = if ($p -match '(?i)\.exe$') { $p } else { "$p.exe" }
+        Remove-Item -LiteralPath $p -Force
+        Copy-Item -LiteralPath $src $dest -Force
+        Write-Host "link $p -> $target  =>  $dest (copy of $src)"
+        $fixed++
+    }
     }
     Write-Host "replaced $fixed link(s) with real files"
 } finally {
