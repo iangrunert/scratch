@@ -31,6 +31,7 @@ function Invoke-Mxc {
         [ValidateSet('pass','fail','info')] [string] $Expect = 'pass',
         [string] $MustContain,
         [switch] $Network,
+        [switch] $Ui,
         [string] $Cwd = $work
     )
     $req = [ordered]@{
@@ -56,6 +57,8 @@ function Invoke-Mxc {
         }
     }
     if ($Network) { $req.processContainer = @{ capabilities = @('internetClient') } }
+    # busybox-w32 links user32; its DLL init fails when Win32k is blocked (the default).
+    if ($Ui) { $req.ui = @{ disable = $false } }
     $cfg = Join-Path $OutDir "$Name.json"
     $req | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $cfg
     Write-Host "::group::$Name  [$CommandLine]"
@@ -90,14 +93,15 @@ Invoke-Mxc 'containment-write-outside' "cmd.exe /c echo x> $outside\pwned.txt" -
 Invoke-Mxc 'containment-read-outside' "cmd.exe /c type $outside\secret.txt" -Expect info
 
 # --- busybox-w32 ------------------------------------------------------------
-Invoke-Mxc 'bb-version'   "$bb\busybox.exe --help" -MustContain 'BusyBox'
-Invoke-Mxc 'bb-sh-basic'  "$bb\busybox.exe sh -c `"echo hi; pwd; uname -a; echo `$((6*7))`"" -MustContain '42'
-Invoke-Mxc 'bb-sh-pipes'  "$bb\busybox.exe sh -c `"seq 1 100 | awk '{s+=`$1} END {print s}' | sed 's/^/sum=/'`"" -MustContain 'sum=5050'
-Invoke-Mxc 'bb-sh-files'  "$bb\busybox.exe sh -c `"mkdir -p d && echo abc > d/f && cat d/f | tr a-z A-Z && ls -l d && rm -r d`"" -MustContain 'ABC'
-Invoke-Mxc 'bb-sh-subshell-func' "$bb\busybox.exe sh -c `"f() { echo fn:`$1; }; (f sub); x=`$(f cmd); echo `$x; for i in 1 2 3; do echo it`$i; done`"" -MustContain 'it3'
-Invoke-Mxc 'bb-sh-spawn-native' "$bb\busybox.exe sh -c `"cmd.exe /c echo native-child; echo rc=`$?`"" -MustContain 'native-child'
-Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx/outside/bb.txt`"" -Expect fail
-Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-sh-exe'
+Invoke-Mxc 'bb-default-ui-policy' "$bb\busybox.exe --help" -Expect info
+Invoke-Mxc 'bb-version'   "$bb\busybox.exe --help" -MustContain 'BusyBox' -Ui
+Invoke-Mxc 'bb-sh-basic'  "$bb\busybox.exe sh -c `"echo hi; pwd; uname -a; echo `$((6*7))`"" -MustContain '42' -Ui
+Invoke-Mxc 'bb-sh-pipes'  "$bb\busybox.exe sh -c `"seq 1 100 | awk '{s+=`$1} END {print s}' | sed 's/^/sum=/'`"" -MustContain 'sum=5050' -Ui
+Invoke-Mxc 'bb-sh-files'  "$bb\busybox.exe sh -c `"mkdir -p d && echo abc > d/f && cat d/f | tr a-z A-Z && ls -l d && rm -r d`"" -MustContain 'ABC' -Ui
+Invoke-Mxc 'bb-sh-subshell-func' "$bb\busybox.exe sh -c `"f() { echo fn:`$1; }; (f sub); x=`$(f cmd); echo `$x; for i in 1 2 3; do echo it`$i; done`"" -MustContain 'it3' -Ui
+Invoke-Mxc 'bb-sh-spawn-native' "$bb\busybox.exe sh -c `"cmd.exe /c echo native-child; echo rc=`$?`"" -MustContain 'native-child' -Ui
+Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx/outside/bb.txt`"" -Expect fail -Ui
+Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-sh-exe' -Ui
 
 # --- native git -------------------------------------------------------------
 if ($haveGit) {
@@ -114,15 +118,16 @@ if ($haveGit) {
     Invoke-Mxc 'git-write-outside' "$g init -q $outside\repo" -Expect fail
 
     # Features that need a POSIX shell, served by busybox sh.exe on PATH.
-    Invoke-Mxc 'git-config-shell-alias' "$g -C r1 config alias.hi `"!echo alias-ran-in-sh `$((1+1))`""
-    Invoke-Mxc 'git-shell-alias' "$g -C r1 hi" -MustContain 'alias-ran-in-sh 2'
+    Invoke-Mxc 'git-config-shell-alias' "$g -C r1 config alias.hi `"!echo alias-ran-in-sh `$((1+1))`"" -Ui
+    Invoke-Mxc 'git-shell-alias' "$g -C r1 hi" -MustContain 'alias-ran-in-sh 2' -Ui
+    Invoke-Mxc 'git-shell-alias-default-ui-policy' "$g -C r1 hi" -Expect info
     Invoke-Mxc 'git-hook' ("$bb\sh.exe -c `"cd r1 && printf '#!/bin/sh\necho hook-ran-from-busybox\n' > .git/hooks/pre-commit && " +
-        "git commit -q --allow-empty -m hooked`"") -MustContain 'hook-ran-from-busybox'
+        "git commit -q --allow-empty -m hooked`"") -MustContain 'hook-ran-from-busybox' -Ui
     Invoke-Mxc 'git-sequence-editor' ("$bb\sh.exe -c `"cd r1 && GIT_SEQUENCE_EDITOR='sed -i 1s/^pick/reword/' GIT_EDITOR='sed -i 1s/.*/reworded-by-sed/' " +
-        "git rebase -q -i HEAD~1 && git log -1 --format=%s`"") -MustContain 'reworded-by-sed'
-    Invoke-Mxc 'git-filter-branch-sh-script' ("$bb\sh.exe -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s`"") -MustContain 'fb:'
-    Invoke-Mxc 'git-difftool-extcmd' "$bb\sh.exe -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~2 HEAD -- a.txt; echo rc=`$?`"" -MustContain 'more'
-    Invoke-Mxc 'git-sh-scripts-in-busybox' "$bb\sh.exe -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top='
+        "git rebase -q -i HEAD~1 && git log -1 --format=%s`"") -MustContain 'reworded-by-sed' -Ui
+    Invoke-Mxc 'git-filter-branch-sh-script' ("$bb\sh.exe -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s`"") -MustContain 'fb:' -Ui
+    Invoke-Mxc 'git-difftool-extcmd' "$bb\sh.exe -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~2 HEAD -- a.txt; echo rc=`$?`"" -MustContain 'more' -Ui
+    Invoke-Mxc 'git-sh-scripts-in-busybox' "$bb\sh.exe -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui
     Invoke-Mxc 'git-https-ls-remote' "$g ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
     Invoke-Mxc 'git-https-ls-remote-schannel' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
 }

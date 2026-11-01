@@ -12,6 +12,9 @@ bad = []
 for path in sorted(root.rglob("*")):
     if path.suffix.lower() not in (".exe", ".dll"):
         continue
+    if not path.exists():
+        print(f"dangling link (skipped): {path} -> {path.readlink() if path.is_symlink() else '?'}")
+        continue
     pe = pefile.PE(str(path), fast_load=True)
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
     dlls = sorted({e.dll.decode().lower() for e in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])})

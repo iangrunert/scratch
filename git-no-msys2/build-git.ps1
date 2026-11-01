@@ -53,6 +53,20 @@ try {
     if ($LASTEXITCODE) { throw "meson compile failed ($LASTEXITCODE)" }
     meson install -C build --no-rebuild
     if ($LASTEXITCODE) { throw "meson install failed ($LASTEXITCODE)" }
+    # Meson installs dashed builtins (git-upload-pack.exe, ...) as links; replace
+    # any that do not resolve with real copies so the tree is relocatable.
+    $gitExe = Join-Path $Prefix 'bin\git.exe'
+    $fixed = 0
+    Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType } | ForEach-Object {
+        $p = $_.FullName
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or $_.LinkType -eq 'SymbolicLink') {
+            Write-Host "link $p -> $($_.Target)"
+            Remove-Item -LiteralPath $p -Force
+            Copy-Item $gitExe $p
+            $fixed++
+        }
+    }
+    Write-Host "replaced $fixed link(s) with copies of git.exe"
 } finally {
     Pop-Location
 }
