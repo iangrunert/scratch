@@ -7,13 +7,14 @@ on:
       git_ref:
         description: git/git ref to build
         default: master
+      mxc_ref:
+        description: iangrunert/mxc ref to build wxc-exec from
+        default: main
   push:
     branches: [git-no-msys2]
     paths: ['git-no-msys2/**', '.github/workflows/git-no-msys2.yml']
 permissions:
   contents: read
-env:
-  MXC_SDK_VERSION: 1.0.1
 jobs:
   build:
     name: build git (${{ matrix.arch }}, MSVC + busybox tools)
@@ -66,10 +67,51 @@ jobs:
           path: C:/git-native
           retention-days: 7
 
+  build-mxc:
+    # Built from source: current MXC has no AppContainer fallback tiers, so the
+    # probe and every launch either use native BaseContainer (PSEC) or refuse.
+    name: build wxc-exec (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: iangrunert/mxc
+          ref: ${{ inputs.mxc_ref || 'main' }}
+          path: mxc
+      - name: Toolchain and dependency feed
+        shell: bash
+        working-directory: mxc
+        run: |
+          cp src/rust-toolchain.toml rust-toolchain.toml
+          cat .azure-pipelines/.cargo/config.public.toml >> .cargo/config.toml
+          rustup show active-toolchain || rustup toolchain install 1.93 --profile minimal
+          rustup target add ${{ matrix.target }}
+          git -C . log -1 --format='mxc %H %s'
+      - name: cargo build wxc-exec
+        shell: bash
+        working-directory: mxc/src
+        run: cargo build --locked --release --target ${{ matrix.target }} -p wxc --bin wxc-exec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wxc-exec-${{ matrix.arch }}
+          path: mxc/src/target/${{ matrix.target }}/release/wxc-exec.exe
+          retention-days: 7
+
   mxc:
     name: MXC ProcessContainer (${{ matrix.arch }}, ${{ matrix.runner }})
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [build, build-mxc]
+    if: ${{ !cancelled() && needs.build-mxc.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -91,20 +133,18 @@ jobs:
         with:
           name: git-native-${{ matrix.arch }}
           path: C:/git-native
-      - name: Fetch wxc-exec from @microsoft/mxc-sdk and busybox-w32
+      - uses: actions/download-artifact@v4
+        with:
+          name: wxc-exec-${{ matrix.arch }}
+          path: ${{ runner.temp }}/mxc
+      - name: Fetch busybox-w32
         shell: pwsh
-        run: |
-          $d = Join-Path $env:RUNNER_TEMP 'mxc'; New-Item -ItemType Directory -Force $d | Out-Null
-          Push-Location $d
-          npm pack "@microsoft/mxc-sdk@$env:MXC_SDK_VERSION" | Out-Null
-          tar -xzf (Get-ChildItem *.tgz).FullName
-          Pop-Location
-          Invoke-WebRequest ${{ matrix.busybox }} -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
+        run: Invoke-WebRequest ${{ matrix.busybox }} -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
       - name: Run git and busybox inside ProcessContainer
         shell: pwsh
         run: >
           scratch/git-no-msys2/test-in-mxc.ps1
-          -WxcExec "$env:RUNNER_TEMP\mxc\package\bin\${{ matrix.arch }}\wxc-exec.exe"
+          -WxcExec "$env:RUNNER_TEMP\mxc\wxc-exec.exe"
           -GitRoot C:\git-native
           -BusyboxExe "$env:RUNNER_TEMP\busybox.exe"
           -OutDir "$env:RUNNER_TEMP\mxc-out"

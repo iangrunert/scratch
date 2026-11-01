@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory)] [string] $WxcExec,
     [string] $GitRoot,            # install prefix containing bin\git.exe (optional)
     [Parameter(Mandatory)] [string] $BusyboxExe,
-    [Parameter(Mandatory)] [string] $OutDir
+    [Parameter(Mandatory)] [string] $OutDir,
+    # The run is only meaningful on the native ProcessContainer (BaseContainer/PSEC) tier.
+    [string] $RequireTier = 'base-container'
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -86,6 +88,20 @@ $probe | Set-Content (Join-Path $OutDir 'probe.json')
 $os = Get-CimInstance Win32_OperatingSystem
 $ubr = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR
 $osLine = "$($os.Caption) build $($os.BuildNumber).$ubr ($env:PROCESSOR_ARCHITECTURE)"
+Write-Host "Host: $osLine"
+$tier = $null
+try { $tier = ($probe | ConvertFrom-Json).tier } catch { }
+if ($RequireTier -and $tier -ne $RequireTier) {
+    $msg = "ProcessContainer tier is '$($tier ?? '<none>')', not '$RequireTier', on $osLine. " +
+           "Native PSEC needs Windows 11 24H2/25H2 build 26100.9278/26200.9278 or later (26H1: 28000.2804); " +
+           "see mxc docs/backends/process-container/os-version-support.md."
+    if ($env:GITHUB_STEP_SUMMARY) {
+        @("### MXC ProcessContainer: $osLine", '', "**Not run:** $msg", '', '```json', $probe.Trim(), '```') -join "`n" |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+    }
+    Write-Host "::error::$msg"
+    exit 1
+}
 
 # --- Baseline ---------------------------------------------------------------
 Invoke-Mxc 'baseline-cmd' 'cmd.exe /c echo hello-from-container' -MustContain 'hello-from-container'
@@ -128,6 +144,7 @@ if ($haveGit) {
     Invoke-Mxc 'git-filter-branch-sh-script' ("$bb\sh.exe -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s`"") -MustContain 'fb:' -Ui
     Invoke-Mxc 'git-difftool-extcmd' "$bb\sh.exe -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~2 HEAD -- a.txt; echo rc=`$?`"" -MustContain 'more' -Ui
     Invoke-Mxc 'git-sh-scripts-in-busybox' "$bb\sh.exe -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui
+    Invoke-Mxc 'git-submodule-sh-wrapper' "$bb\sh.exe -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status`"" -MustContain ' sub' -Ui
     Invoke-Mxc 'git-https-ls-remote' "$g ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
     Invoke-Mxc 'git-https-ls-remote-schannel' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
 }
