@@ -53,20 +53,28 @@ try {
     if ($LASTEXITCODE) { throw "meson compile failed ($LASTEXITCODE)" }
     meson install -C build --no-rebuild
     if ($LASTEXITCODE) { throw "meson install failed ($LASTEXITCODE)" }
-    # Meson installs dashed builtins (git-upload-pack.exe, ...) as links; replace
-    # any that do not resolve with real copies so the tree is relocatable.
+    # Meson installs dashed builtins (git-upload-pack.exe, ...) as links, some of
+    # which do not resolve on Windows; replace them with real files.
     $gitExe = Join-Path $Prefix 'bin\git.exe'
     $fixed = 0
     Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType } | ForEach-Object {
         $p = $_.FullName
         if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or $_.LinkType -eq 'SymbolicLink') {
-            Write-Host "link $p -> $($_.Target)"
+            $target = $_.Target | Select-Object -First 1
+            $src = $gitExe
+            if ($target) {
+                $abs = if ([IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Split-Path $p) $target }
+                if (Test-Path -LiteralPath $abs -PathType Leaf) { $src = (Resolve-Path -LiteralPath $abs).Path }
+            }
+            Write-Host "link $p -> $target (copying $src)"
+            $tmp = "$p.tmp"
+            Copy-Item -LiteralPath $src $tmp
             Remove-Item -LiteralPath $p -Force
-            Copy-Item $gitExe $p
+            Move-Item $tmp $p
             $fixed++
         }
     }
-    Write-Host "replaced $fixed link(s) with copies of git.exe"
+    Write-Host "replaced $fixed link(s) with real files"
 } finally {
     Pop-Location
 }
