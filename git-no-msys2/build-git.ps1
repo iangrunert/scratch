@@ -47,7 +47,7 @@ try {
         -Druntime_prefix=true `
         -Dperl=disabled -Dpython=disabled -Drust=disabled `
         -Dgettext=disabled -Dgitk=disabled -Dgit_gui=disabled -Dgitweb=disabled `
-        -Ddocs=[] -Dcredential_helpers=wincred
+        -Dcredential_helpers=wincred
     if ($LASTEXITCODE) { throw "meson setup failed ($LASTEXITCODE)" }
     meson compile -C build
     if ($LASTEXITCODE) { throw "meson compile failed ($LASTEXITCODE)" }

@@ -70,10 +70,8 @@ function Invoke-Mxc {
         'fail' { $code -ne 0 -or ($MustContain -and $text -notmatch $MustContain) }
         'info' { $true }
     }
-    $results.Add([pscustomobject]@{
-        Name = $Name; Expect = $Expect; Exit = $code; Ok = $ok
-        Tail = (($out | Select-Object -Last 3) -join ' | ') -replace '\|', '/'
-    })
+    $tail = (($out | Select-Object -Last 3) -join ' / ').Replace('|', '/')
+    $results.Add([pscustomobject]@{ Name = $Name; Expect = $Expect; Exit = $code; Ok = $ok; Tail = $tail })
 }
 
 # --- Host capability -------------------------------------------------------
