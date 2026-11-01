@@ -60,6 +60,7 @@ function Invoke-Mxc {
         [switch] $HostLoopback,
         [string[]] $ExtraReadonly = @(),
         [switch] $Ui,
+        [string[]] $ExtraEnv = @(),
         [string] $Cwd = $work
     )
     $req = [ordered]@{
@@ -81,7 +82,7 @@ function Invoke-Mxc {
                 'GIT_PAGER=cat', 'PAGER=cat',
                 'GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=safe.directory', 'GIT_CONFIG_VALUE_0=*',
                 'GIT_COMMITTER_NAME=mxc', 'GIT_COMMITTER_EMAIL=mxc@example.com'
-            )
+            ) + $ExtraEnv
         }
         filesystem  = [ordered]@{
             readonlyPaths  = @(@($bb) + $(if ($haveGit) { @($git) } else { @() }) + $ExtraReadonly + $script:ParentGrant |
@@ -205,6 +206,27 @@ if ($haveGit) {
         Invoke-Mxc 'gfw-cmd-launcher'      "$git\cmd\git.exe --version" -MustContain 'git version' -Ui:$gitUi
         Invoke-Mxc 'gfw-msys-sh-version'   "$sh --version" -MustContain 'bash' -Ui:$shUi
         Invoke-Mxc 'gfw-msys-sh-default-ui' "$sh -c `"echo msys-ok`"" -Expect info -MustContain 'msys-ok'
+
+        # Schannel through Git for Windows' native (MinGW) programs. MSYS2's own
+        # usr\bin programs die at startup in the container and use OpenSSL anyway.
+        $curl = "$gitBin\curl.exe"
+        Invoke-Mxc 'gfw-curl-version' "$curl -V" -Expect info -MustContain 'Schannel' -Ui:$gitUi
+        $tlsCases = [ordered]@{
+            'valid'       = @('https://github.com/robots.txt', 'pass')
+            'self-signed' = @('https://self-signed.badssl.com/', 'fail')
+            'wrong-host'  = @('https://wrong.host.badssl.com/', 'fail')
+            'expired'     = @('https://expired.badssl.com/', 'fail')
+        }
+        foreach ($c in $tlsCases.Keys) {
+            $url, $expect = $tlsCases[$c]
+            foreach ($lb in $false, $true) {
+                $sfx = if ($lb) { '-loopback' } else { '' }
+                Invoke-Mxc "gfw-curl-schannel-$c$sfx" "$curl -sS -o NUL -w http=%{http_code} $url" -Expect $expect `
+                    -ExtraEnv 'CURL_SSL_BACKEND=schannel' -Network -HostLoopback:$lb -Ui:$gitUi
+                Invoke-Mxc "gfw-git-schannel-$c$sfx" "$gitBin\git.exe -c http.sslBackend=schannel ls-remote $url" -Expect info `
+                    -Network -HostLoopback:$lb -Ui:$gitUi
+            }
+        }
     }
     # Each case is a fresh container; the repositories persist in $work.
     # Direct launches: wxc-exec starts git, and git starts its own children
