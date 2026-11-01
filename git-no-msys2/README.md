@@ -52,7 +52,7 @@ MXC 1.0.1 from npm silently falls back to AppContainer + DACL there.
 The `mxc` job also runs the same cases with the runner's Git for Windows
 2.56.0.windows.3 (MinGW git plus the MSYS2 runtime and bash, used as `sh`).
 
-| Case | This build, Win32k allowed | This build, `user32` delay-loaded, Win32k blocked | Git for Windows, Win32k allowed | Git for Windows, Win32k blocked |
+| Case | This build, Win32k allowed | This build, `user32` delay-loaded, Win32k blocked for git launches (busybox cases still allowed) | Git for Windows, Win32k allowed | Git for Windows, Win32k blocked |
 |---|---|---|---|---|
 | `git --version`, init, commit, switch, merge, log | pass | pass | pass | fails at load (`STATUS_DLL_INIT_FAILED`) |
 | `clone --no-local` (starts `upload-pack` through `sh`), then gc, fsck | pass | fails: busybox `sh` needs Win32k | fails: MSYS2 `sh` | fails at load |
