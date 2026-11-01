@@ -100,7 +100,8 @@ try {
         }
         # The same path is substituted for @SHELL_PATH@ in script bodies
         # (git-filter-branch runs "$SHELL_PATH" -c ...).
-        foreach ($p in @("$tools\sh.exe", (($tools -replace '\\', '/') + '/sh.exe'))) {
+        # Meson's sed step also strips the backslashes (C:\a\_temp\... -> C:a_temp...).
+        foreach ($p in @("$tools\sh.exe", (($tools -replace '\\', '/') + '/sh.exe'), ($tools.Replace('\', '') + 'sh.exe'))) {
             if ($text.Contains($p)) { Write-Host "SHELL_PATH in $($_.Name): $p -> sh"; $text = $text.Replace($p, 'sh') }
         }
         [IO.File]::WriteAllText($_.FullName, $text)
