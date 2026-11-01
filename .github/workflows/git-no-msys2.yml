@@ -114,21 +114,32 @@ jobs:
           retention-days: 7
 
   mxc:
-    name: MXC BaseContainer (${{ matrix.variant }}, Win32k for git ${{ matrix.git_ui && 'allowed' || 'blocked' }})
+    name: MXC BaseContainer (${{ matrix.variant }}, Win32k ${{ matrix.git_ui && 'allowed' || 'blocked' }})
     needs: [build, build-mxc]
     if: ${{ !cancelled() && needs.build-mxc.result == 'success' }}
-    # The Win32k-blocked variant is an experiment: git transport subprocesses
-    # still need user32 there, so its failures are expected findings.
-    continue-on-error: ${{ !matrix.git_ui }}
+    # The Win32k-blocked native variant and the Git for Windows comparison
+    # record findings; their failures do not fail the workflow.
+    continue-on-error: ${{ !matrix.git_ui || matrix.flavor == 'gfw' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - variant: arm64
             arch: arm64
+            flavor: native
             git_ui: true
           - variant: arm64-delayload-user32
             arch: arm64
+            flavor: native
+            git_ui: false
+          # Comparison: the runner's Git for Windows (MSYS2 runtime and bash).
+          - variant: git-for-windows
+            arch: arm64
+            flavor: gfw
+            git_ui: true
+          - variant: git-for-windows
+            arch: arm64
+            flavor: gfw
             git_ui: false
     runs-on: windows-11-arm
     env:
@@ -139,7 +150,7 @@ jobs:
         with:
           path: scratch
       - uses: actions/download-artifact@v4
-        continue-on-error: true
+        if: matrix.flavor == 'native'
         with:
           name: git-native-${{ matrix.variant }}
           path: C:/git-native
@@ -155,12 +166,13 @@ jobs:
         run: >
           scratch/git-no-msys2/test-in-mxc.ps1
           -WxcExec "$env:RUNNER_TEMP\mxc\wxc-exec.exe"
-          -GitRoot C:\git-native
+          -GitRoot "${{ matrix.flavor == 'gfw' && 'C:\Program Files\Git' || 'C:\git-native' }}"
+          -GitFlavor ${{ matrix.flavor }}
           -BusyboxExe "$env:RUNNER_TEMP\busybox.exe"
           -OutDir "$env:RUNNER_TEMP\mxc-out"
           -GitWithoutUi:$${{ !matrix.git_ui }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mxc-results-${{ matrix.variant }}-gitui-${{ matrix.git_ui }}
+          name: mxc-results-${{ matrix.variant }}-win32k-${{ matrix.git_ui && 'allowed' || 'blocked' }}
           path: ${{ runner.temp }}/mxc-out

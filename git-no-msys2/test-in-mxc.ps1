@@ -1,7 +1,10 @@
-# Run native git and busybox-w32 inside an MXC ProcessContainer via wxc-exec.
+# Run git and busybox-w32 inside an MXC ProcessContainer via wxc-exec.
 param(
     [Parameter(Mandatory)] [string] $WxcExec,
-    [string] $GitRoot,            # install prefix containing bin\git.exe (optional)
+    # native: the MSVC build's install prefix (bin\git.exe); its shell is busybox sh.
+    # gfw: a Git for Windows install (cmd\git.exe, MSYS2 usr\bin\sh.exe).
+    [string] $GitRoot,
+    [ValidateSet('native', 'gfw')] [string] $GitFlavor = 'native',
     [Parameter(Mandatory)] [string] $BusyboxExe,
     [Parameter(Mandatory)] [string] $OutDir,
     # The run is only meaningful on the native ProcessContainer (BaseContainer/PSEC) tier.
@@ -22,8 +25,27 @@ New-Item -ItemType Directory -Force $bb, $work, "$work\home", "$work\tmp", $outs
 Copy-Item $BusyboxExe "$bb\busybox.exe"
 Copy-Item $BusyboxExe "$bb\sh.exe"     # git looks up "sh" on PATH
 "secret" | Set-Content "$outside\secret.txt"
-$haveGit = $GitRoot -and (Test-Path "$GitRoot\bin\git.exe")
-if ($haveGit) { Copy-Item -Recurse $GitRoot $git }
+$gitUi = -not $GitWithoutUi
+if ($GitFlavor -eq 'gfw') {
+    $git = "$sbx\gfw"
+    $haveGit = $GitRoot -and (Test-Path "$GitRoot\cmd\git.exe")
+    if ($haveGit) {
+        Copy-Item -Recurse $GitRoot $git
+        $mingw = @('clangarm64', 'mingw64', 'ucrt64') | Where-Object { Test-Path "$git\$_\bin\git.exe" } | Select-Object -First 1
+        $gitBin = "$git\$mingw\bin"
+        & "$gitBin\git.exe" --version
+    }
+    $pathDirs = "$git\cmd;$gitBin;$git\usr\bin;$bb"
+    $sh = "$git\usr\bin\sh.exe"     # MSYS2 bash
+    $shUi = $gitUi
+} else {
+    $haveGit = $GitRoot -and (Test-Path "$GitRoot\bin\git.exe")
+    if ($haveGit) { Copy-Item -Recurse $GitRoot $git }
+    $gitBin = "$git\bin"
+    $pathDirs = "$gitBin;$bb"
+    $sh = "$bb\sh.exe"                # busybox-w32 needs Win32k
+    $shUi = $true
+}
 
 $env:WXC_SCRATCH = $OutDir
 $results = [System.Collections.Generic.List[object]]::new()
@@ -50,7 +72,7 @@ function Invoke-Mxc {
             timeout           = 120000
             inheritDefaultEnv = $true
             env = @(
-                "PATH=$git\bin;$bb;C:\Windows\System32;C:\Windows",
+                "PATH=$script:pathDirs;C:\Windows\System32;C:\Windows",
                 "HOME=$work\home", "USERPROFILE=$work\home",
                 "TMP=$work\tmp", "TEMP=$work\tmp",
                 'GIT_CONFIG_NOSYSTEM=1', 'GIT_AUTHOR_NAME=mxc', 'GIT_AUTHOR_EMAIL=mxc@example.com',
@@ -153,11 +175,14 @@ Invoke-Mxc 'bb-sh-spawn-native' "$bb\busybox.exe sh -c `"cmd.exe /c echo native-
 Invoke-Mxc 'bb-sh-write-outside' "$bb\busybox.exe sh -c `"echo x > C:/sbx-outside/bb.txt`"" -Expect fail -Ui
 Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-sh-exe' -Ui
 
-# --- native git -------------------------------------------------------------
+# --- git ---------------------------------------------------------------------
 if ($haveGit) {
-    $g = "$git\bin\git.exe"
-    $gitUi = -not $GitWithoutUi
-    $sh = "$bb\sh.exe"
+    $g = "$gitBin\git.exe"
+    if ($GitFlavor -eq 'gfw') {
+        Invoke-Mxc 'gfw-cmd-launcher'      "$git\cmd\git.exe --version" -MustContain 'git version' -Ui:$gitUi
+        Invoke-Mxc 'gfw-msys-sh-version'   "$sh --version" -MustContain 'bash' -Ui:$shUi
+        Invoke-Mxc 'gfw-msys-sh-default-ui' "$sh -c `"echo msys-ok`"" -Expect info -MustContain 'msys-ok'
+    }
     # Each case is a fresh container; the repositories persist in $work.
     # Direct launches: wxc-exec starts git, and git starts its own children
     # (upload-pack for clone, pack-objects/repack for gc).
@@ -181,28 +206,28 @@ if ($haveGit) {
     # busybox sh driving git, and git starting busybox sh (needs Win32k for busybox).
     # Output of the last external command in "sh -c" went missing in earlier runs.
     # Compare inside vs outside the container, and with a trailing builtin.
-    $savedPath = $env:PATH; $env:PATH = "$git\bin;$bb;$env:SystemRoot\System32;$env:SystemRoot"
+    $savedPath = $env:PATH; $env:PATH = "$pathDirs;$env:SystemRoot\System32;$env:SystemRoot"
     $hostOut = & $sh -c 'cd C:/sbx; git --version' 2>&1 | Out-String
     $env:PATH = $savedPath
     Write-Host "host (no container) sh -c 'git --version' => [$($hostOut.Trim())]"
     $results.Add([pscustomobject]@{ Name = 'host-sh-last-external-output'; Expect = 'info'; Exit = $LASTEXITCODE; Ok = $true; Tail = $hostOut.Trim() })
-    Invoke-Mxc 'sh-last-external-output'   "$sh -c `"git --version`"" -Expect info -MustContain 'git version' -Ui
-    Invoke-Mxc 'sh-last-builtin-output'    "$sh -c `"git --version; echo end`"" -Expect info -MustContain 'git version' -Ui
-    Invoke-Mxc 'sh-last-external-native'   "$sh -c `"cmd.exe /c echo from-cmd`"" -Expect info -MustContain 'from-cmd' -Ui
-    Invoke-Mxc 'sh-starts-git'      "$sh -c `"git --version; echo rc=`$?`"" -MustContain 'rc=0' -Ui
+    Invoke-Mxc 'sh-last-external-output'   "$sh -c `"git --version`"" -Expect info -MustContain 'git version' -Ui:$shUi
+    Invoke-Mxc 'sh-last-builtin-output'    "$sh -c `"git --version; echo end`"" -Expect info -MustContain 'git version' -Ui:$shUi
+    Invoke-Mxc 'sh-last-external-native'   "$sh -c `"cmd.exe /c echo from-cmd`"" -Expect info -MustContain 'from-cmd' -Ui:$shUi
+    Invoke-Mxc 'sh-starts-git'      "$sh -c `"git --version; echo rc=`$?`"" -MustContain 'rc=0' -Ui:$shUi
     Invoke-Mxc 'sh-edit-diff-commit' ("$sh -c `"cd r1 && echo hello > a.txt && git add a.txt && git commit -q -m add-a && echo more >> a.txt && " +
-        "git diff --stat && git commit -q -am more && git log --oneline -3; echo end=`$?`"") -MustContain 'more' -Ui
-    Invoke-Mxc 'sh-stash'           "$sh -c `"cd r1 && echo w >> a.txt && git stash -q && git stash list && git stash pop -q && git checkout -q -- . && git status --short; echo end=`$?`"" -MustContain 'stash@' -Ui
+        "git diff --stat && git commit -q -am more && git log --oneline -3; echo end=`$?`"") -MustContain 'more' -Ui:$shUi
+    Invoke-Mxc 'sh-stash'           "$sh -c `"cd r1 && echo w >> a.txt && git stash -q && git stash list && git stash pop -q && git checkout -q -- . && git status --short; echo end=`$?`"" -MustContain 'stash@' -Ui:$shUi
     Invoke-Mxc 'git-config-shell-alias' "$g -C r1 config alias.hi `"!echo alias-ran-in-sh `$((1+1))`"" -Ui:$gitUi
-    Invoke-Mxc 'git-shell-alias'    "$g -C r1 hi" -MustContain 'alias-ran-in-sh 2' -Ui
-    Invoke-Mxc 'git-hook' ("$sh -c `"cd r1 && printf '#!/bin/sh\necho hook-ran-from-busybox\n' > .git/hooks/pre-commit && " +
-        "git commit -q --allow-empty -m hooked; echo end=`$?`"") -MustContain 'hook-ran-from-busybox' -Ui
+    Invoke-Mxc 'git-shell-alias'    "$g -C r1 hi" -MustContain 'alias-ran-in-sh 2' -Ui:$shUi
+    Invoke-Mxc 'git-hook' ("$sh -c `"cd r1 && printf '#!/bin/sh\necho hook-ran\n' > .git/hooks/pre-commit && " +
+        "git commit -q --allow-empty -m hooked; echo end=`$?`"") -MustContain 'hook-ran' -Ui:$shUi
     Invoke-Mxc 'git-sequence-editor' ("$sh -c `"cd r1 && GIT_SEQUENCE_EDITOR='sed -i 1s/^pick/reword/' GIT_EDITOR='sed -i 1s/.*/reworded-by-sed/' " +
-        "git rebase -q -i HEAD~1 && git log -1 --format=%s; echo end=`$?`"") -MustContain 'reworded-by-sed' -Ui
-    Invoke-Mxc 'git-difftool-extcmd' "$sh -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~3 HEAD -- a.txt; echo end=`$?`"" -MustContain 'more' -Ui
-    Invoke-Mxc 'git-sh-setup'       "$sh -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui
-    Invoke-Mxc 'git-filter-branch'  "$sh -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s; echo end=`$?`"" -MustContain 'fb:' -Ui
-    Invoke-Mxc 'git-submodule'      "$sh -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status; echo end=`$?`"" -MustContain ' sub' -Ui
+        "git rebase -q -i HEAD~1 && git log -1 --format=%s; echo end=`$?`"") -MustContain 'reworded-by-sed' -Ui:$shUi
+    Invoke-Mxc 'git-difftool-extcmd' "$sh -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~3 HEAD -- a.txt; echo end=`$?`"" -MustContain 'more' -Ui:$shUi
+    Invoke-Mxc 'git-sh-setup'       "$sh -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui:$shUi
+    Invoke-Mxc 'git-filter-branch'  "$sh -c `"cd r2 && FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --msg-filter 'sed s/^/fb:/' HEAD~1..HEAD && git log -1 --format=%s; echo end=`$?`"" -MustContain 'fb:' -Ui:$shUi
+    Invoke-Mxc 'git-submodule'      "$sh -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status; echo end=`$?`"" -MustContain ' sub' -Ui:$shUi
 }
 
 # --- Report -----------------------------------------------------------------
