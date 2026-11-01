@@ -55,28 +55,34 @@ try {
     if ($LASTEXITCODE) { throw "meson install failed ($LASTEXITCODE)" }
     # Meson's Windows install leaves bin\git and the dashed builtins in
     # libexec\git-core as symlinks to extensionless names (e.g. "git"), which do
-    # not resolve. Replace each with a real <name>.exe copy of its target.
-    # Links can point at other links, so resolve in passes.
-    $fixed = 0
-    foreach ($pass in 1..4) {
-    $links = @(Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType -eq 'SymbolicLink' })
-    if (-not $links) { break }
-    $links | ForEach-Object {
-        $p = $_.FullName
-        $target = $_.Target | Select-Object -First 1
-        $abs = if ([IO.Path]::IsPathRooted($target)) { $target } else { Join-Path (Split-Path $p) $target }
-        $src = @($abs, "$abs.exe") | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-        if (-not $src) {
-            if ($pass -eq 4) { throw "cannot resolve link $p -> $target" }
-            return
+    # not resolve. Replace each with a real <name>.exe copy of its final target.
+    function Resolve-GitLink([string] $dir, [string] $target, [int] $depth = 0) {
+        if ($depth -gt 8) { throw "link chain too deep at $dir\$target" }
+        $abs = if ([IO.Path]::IsPathRooted($target)) { $target } else { Join-Path $dir $target }
+        foreach ($c in @($abs, "$abs.exe")) {
+            $item = Get-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue
+            if (-not $item -or $item.PSIsContainer) { continue }
+            if ($item.LinkType -eq 'SymbolicLink') {
+                return Resolve-GitLink (Split-Path $item.FullName) ($item.Target | Select-Object -First 1) ($depth + 1)
+            }
+            return $item.FullName
         }
-        $dest = if ($p -match '(?i)\.exe$') { $p } else { "$p.exe" }
-        Remove-Item -LiteralPath $p -Force
-        Copy-Item -LiteralPath $src $dest -Force
-        Write-Host "link $p -> $target  =>  $dest (copy of $src)"
-        $fixed++
+        throw "cannot resolve $abs"
     }
+    $links = @(Get-ChildItem -Recurse -Force $Prefix | Where-Object { $_.LinkType -eq 'SymbolicLink' })
+    $plan = foreach ($l in $links) {
+        [pscustomobject]@{
+            Link = $l.FullName
+            Src  = Resolve-GitLink (Split-Path $l.FullName) ($l.Target | Select-Object -First 1)
+            Dest = if ($l.FullName -match '(?i)\.exe$') { $l.FullName } else { "$($l.FullName).exe" }
+        }
     }
+    $links | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    foreach ($e in $plan) {
+        Copy-Item -LiteralPath $e.Src $e.Dest -Force
+        Write-Host "link $($e.Link)  =>  $($e.Dest) (copy of $($e.Src))"
+    }
+    $fixed = $plan.Count
     Write-Host "replaced $fixed link(s) with real files"
 } finally {
     Pop-Location
