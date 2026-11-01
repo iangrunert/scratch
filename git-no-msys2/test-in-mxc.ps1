@@ -54,6 +54,9 @@ function Invoke-Mxc {
                 "HOME=$work\home", "USERPROFILE=$work\home",
                 "TMP=$work\tmp", "TEMP=$work\tmp",
                 'GIT_CONFIG_NOSYSTEM=1', 'GIT_AUTHOR_NAME=mxc', 'GIT_AUTHOR_EMAIL=mxc@example.com',
+                # Every launch is a new container identity, so files created by
+                # an earlier launch fail git's ownership check.
+                'GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=safe.directory', 'GIT_CONFIG_VALUE_0=*',
                 'GIT_COMMITTER_NAME=mxc', 'GIT_COMMITTER_EMAIL=mxc@example.com'
             )
         }

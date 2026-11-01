@@ -89,6 +89,16 @@ try {
     }
     $fixed = $plan.Count
     Write-Host "replaced $fixed link(s) with real files"
+    # Meson writes the build-time shell path into the shebang of the installed
+    # shell scripts (git-submodule, git-filter-branch, ...). Git for Windows
+    # resolves "#!/bin/sh" to "sh" on PATH, so use that instead.
+    Get-ChildItem -File (Join-Path $Prefix 'libexec\git-core') | Where-Object { -not $_.Extension } | ForEach-Object {
+        $text = [IO.File]::ReadAllText($_.FullName)
+        if ($text -match '^#!(\S+)') {
+            Write-Host "shebang $($_.Name): #!$($Matches[1]) -> #!/bin/sh"
+            [IO.File]::WriteAllText($_.FullName, ($text -replace '^#!\S+', '#!/bin/sh'))
+        }
+    }
 } finally {
     Pop-Location
 }
