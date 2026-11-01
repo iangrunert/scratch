@@ -3,7 +3,8 @@
 `.github/workflows/git-no-msys2.yml` builds upstream `git/git` for Windows with
 Meson and MSVC, using no MSYS2 at build or run time. It then runs that git and
 busybox-w32 inside an MXC ProcessContainer on the native BaseContainer (PSEC)
-tier.
+tier, and compares the results with the standard Git for Windows, which uses
+MSYS2.
 
 ## What the workflow does
 
@@ -48,20 +49,31 @@ MXC 1.0.1 from npm silently falls back to AppContainer + DACL there.
 
 ## Results on `windows-11-arm`, BaseContainer tier
 
-With `ui.disable: false` (Win32k allowed), every case passes. That covers:
+The `mxc` job also runs the same cases with the runner's Git for Windows
+2.56.0.windows.3 (MinGW git plus the MSYS2 runtime and bash, used as `sh`).
 
-- init, commit, switch, merge, log, `clone --no-local` (git starts
-  `upload-pack`), gc (git starts `pack-objects`), fsck, count-objects, stash,
-  diff.
+| Case | This build, Win32k allowed | This build, `user32` delay-loaded, Win32k blocked | Git for Windows, Win32k allowed | Git for Windows, Win32k blocked |
+|---|---|---|---|---|
+| `git --version`, init, commit, switch, merge, log | pass | pass | pass | fails at load (`STATUS_DLL_INIT_FAILED`) |
+| `clone --no-local` (starts `upload-pack` through `sh`), then gc, fsck | pass | fails: busybox `sh` needs Win32k | fails: MSYS2 `sh` | fails at load |
+| HTTPS `ls-remote` to github.com | pass (needs `hostLoopback: allow`) | pass (same) | pass, also without host loopback | fails at load |
+| `sh` itself | busybox: pass | busybox: pass | MSYS2 bash: fails | MSYS2 bash: fails |
+| Hook, `!` alias, `rebase -i` with `sed` editors, `difftool --extcmd`, `git-sh-setup`, `filter-branch`, `submodule add` | pass | pass, except `filter-branch` and `submodule add`, which need a clone | fail (need `sh`) | fail |
+| Write outside `readwritePaths` | denied | denied | denied | fails at load |
 
-- HTTPS `ls-remote` against github.com with OpenSSL and with Schannel.
+In the container, every MSYS2 program dies at startup:
 
-- From busybox `sh`: a `pre-commit` hook, a `!` alias, `rebase -i` with `sed`
-  as `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR`, `difftool --extcmd`,
-  `git-sh-setup`, `filter-branch`, and `submodule add`/`status`.
+```
+sh.exe: *** fatal error - NtCreateDirectoryObject(\BaseNamedObjects\msys-2.0S5-…): 0xC0000022
+```
 
-- Writes outside `readwritePaths` fail with `Permission denied` from git,
-  busybox and `cmd.exe`.
+The MSYS2 runtime (`msys-2.0.dll`, a Cygwin fork) creates a named-object
+directory in `\BaseNamedObjects` for its shared memory. The container denies
+that (`STATUS_ACCESS_DENIED`), whether or not Win32k is allowed. This takes out
+`sh`/bash, the Unix tools in `usr\bin`, and every git feature that goes through
+`sh`. git starts `upload-pack` for local and SSH remotes through `sh` (`connect.c`),
+so `clone --no-local` fails too. Its MinGW `git.exe` imports `user32.dll` for the
+same `poll()` reason as this build.
 
 busybox-w32 works for the shell, pipes, awk/sed/tr, functions, subshells, file
 I/O, and starting native programs.
@@ -73,11 +85,12 @@ I/O, and starting native programs.
    pumps window messages. Under the default UI policy both fail at load with
    `STATUS_DLL_INIT_FAILED (0xC0000142)`.
 
-   Linking git with `/DELAYLOAD:user32.dll` lets git start with Win32k blocked.
-   Local commands, HTTPS, hooks and aliases still work. Any command that starts
-   a transport subprocess and polls its pipes (`clone`, `fetch` over `file://`,
-   `submodule add`) fails. Running fully under the default policy would need
-   git's `poll()` changed to wait without the message pump.
+   Linking git with `/DELAYLOAD:user32.dll` lets git start and run local
+   commands and HTTPS with Win32k blocked. Commands that go through `sh` still
+   fail there, because busybox-w32 needs Win32k. That includes `clone` and
+   `fetch` from a local path or over SSH: `connect.c` runs `git-upload-pack
+   '<path>'` through `sh`. A shell that does not import `user32.dll` would be
+   needed to run fully under the default policy.
 
 2. **HTTPS needs host loopback.** With `network.ingress.hostLoopback: deny`, curl
    fails with `getaddrinfo() thread failed to start`. Its resolver thread
@@ -87,11 +100,12 @@ I/O, and starting native programs.
    launch fails git's ownership check in the next one. The tests set
    `safe.directory=*` through `GIT_CONFIG_COUNT`.
 
-4. **Contained `cmd.exe` cannot start binaries from granted paths.** It gets
-   `Access is denied` for both `readonlyPaths` and `readwritePaths`, even with
-   the parent folder granted. It can still start System32 tools. git and
-   busybox can start each other from the same paths, so the tests launch git
-   directly or through busybox `sh`.
+4. **Contained `cmd.exe` cannot start busybox or this git.** It gets
+   `Access is denied` for both, from `readonlyPaths` and `readwritePaths`, even
+   with the parent folder granted and Win32k allowed. It can start System32's
+   `whoami.exe` and MSYS2's `whoami.exe` from a granted path. Both binaries it
+   fails on import `user32.dll`. busybox `sh` and git can start each other and
+   their children, so the tests launch git directly or through busybox `sh`.
 
 5. **Output of the last command in `sh -c` is lost inside the container.**
    `sh -c "git --version"` prints nothing in the container (exit code 0),
