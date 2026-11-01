@@ -1,0 +1,115 @@
+# Can Git for Windows be built and run without MSYS2, and do native git and
+# busybox-w32 work inside an MXC ProcessContainer?
+name: git without MSYS2 in MXC ProcessContainer
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: git/git ref to build
+        default: master
+  push:
+    branches: [git-no-msys2]
+    paths: ['git-no-msys2/**', '.github/workflows/git-no-msys2.yml']
+permissions:
+  contents: read
+env:
+  MXC_SDK_VERSION: 1.0.1
+jobs:
+  build:
+    name: build git (${{ matrix.arch }}, MSVC + busybox tools)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            busybox: https://frippery.org/files/busybox/busybox64.exe
+          - arch: arm64
+            runner: windows-11-arm
+            busybox: https://frippery.org/files/busybox/busybox64a.exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scratch
+      - uses: actions/checkout@v4
+        with:
+          repository: git/git
+          ref: ${{ inputs.git_ref || 'master' }}
+          path: gitsrc
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install meson ninja pefile
+      - name: Build (MSYS2 and Git for Windows hidden)
+        shell: pwsh
+        run: scratch/git-no-msys2/build-git.ps1 -Source gitsrc -Prefix C:/git-native -BusyboxUrl ${{ matrix.busybox }}
+      - name: Restore hidden directories
+        if: always()
+        shell: pwsh
+        run: |
+          $f = Join-Path $env:RUNNER_TEMP 'hidden-dirs.txt'
+          if (Test-Path $f) { Get-Content $f | ForEach-Object { if ($_) { Rename-Item "$_.hidden" (Split-Path $_ -Leaf) } } }
+      - name: Check DLL imports (no msys-2.0.dll / cygwin1.dll)
+        run: python scratch/git-no-msys2/check_imports.py C:/git-native
+      - name: Smoke test outside the sandbox
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse C:\git-native -File | Measure-Object -Sum Length | ForEach-Object { "files=$($_.Count) bytes=$($_.Sum)" }
+          C:\git-native\bin\git.exe --version --build-options
+          C:\git-native\bin\git.exe --exec-path
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-native-${{ matrix.arch }}
+          path: C:/git-native
+          retention-days: 7
+
+  mxc:
+    name: MXC ProcessContainer (${{ matrix.arch }}, ${{ matrix.runner }})
+    needs: build
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            busybox: https://frippery.org/files/busybox/busybox64.exe
+          - arch: arm64
+            runner: windows-11-arm
+            busybox: https://frippery.org/files/busybox/busybox64a.exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scratch
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: git-native-${{ matrix.arch }}
+          path: C:/git-native
+      - name: Fetch wxc-exec from @microsoft/mxc-sdk and busybox-w32
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'mxc'; New-Item -ItemType Directory -Force $d | Out-Null
+          Push-Location $d
+          npm pack "@microsoft/mxc-sdk@$env:MXC_SDK_VERSION" | Out-Null
+          tar -xzf (Get-ChildItem *.tgz).FullName
+          Pop-Location
+          Invoke-WebRequest ${{ matrix.busybox }} -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
+      - name: Run git and busybox inside ProcessContainer
+        shell: pwsh
+        run: >
+          scratch/git-no-msys2/test-in-mxc.ps1
+          -WxcExec "$env:RUNNER_TEMP\mxc\package\bin\${{ matrix.arch }}\wxc-exec.exe"
+          -GitRoot C:\git-native
+          -BusyboxExe "$env:RUNNER_TEMP\busybox.exe"
+          -OutDir "$env:RUNNER_TEMP\mxc-out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mxc-results-${{ matrix.arch }}
+          path: ${{ runner.temp }}/mxc-out
