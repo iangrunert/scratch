@@ -117,6 +117,9 @@ jobs:
     name: MXC BaseContainer (${{ matrix.variant }}, Win32k for git ${{ matrix.git_ui && 'allowed' || 'blocked' }})
     needs: [build, build-mxc]
     if: ${{ !cancelled() && needs.build-mxc.result == 'success' }}
+    # The Win32k-blocked variant is an experiment: git transport subprocesses
+    # still need user32 there, so its failures are expected findings.
+    continue-on-error: ${{ !matrix.git_ui }}
     strategy:
       fail-fast: false
       matrix:
