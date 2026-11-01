@@ -245,6 +245,12 @@ if ($haveGit) {
     $pwsh7Dir = 'C:\Program Files\PowerShell\7'
     $psScript = "Set-Location C:\sbx\work\r1; & '$g' --version; & '$g' log --oneline -1; `$LASTEXITCODE"
     Invoke-Mxc 'ps51-starts-git' "$ps51 -NoProfile -NonInteractive -Command `"$psScript`"" -Expect info -MustContain 'merged' -Ui:$gitUi
+    $psDiag = "`$PSVersionTable.PSVersion.ToString(); `$env:PSModulePath; `$env:LOCALAPPDATA; " +
+        "Get-Module -ListAvailable Microsoft.PowerShell.Management | ForEach-Object { 'listed: ' + `$_.Path }; " +
+        "try { Import-Module Microsoft.PowerShell.Management -Verbose -ErrorAction Stop; 'import: ok' } catch { 'import failed: ' + `$_.Exception.ToString() }; " +
+        "try { [Reflection.Assembly]::Load('Microsoft.PowerShell.Commands.Management, Version=3.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35').Location } catch { 'assembly load failed: ' + `$_.Exception.ToString() }"
+    Invoke-Mxc 'ps51-module-diag' "$ps51 -NoProfile -NonInteractive -Command `"$psDiag`"" -Expect info -Ui:$gitUi
+    Invoke-Mxc 'ps51-git-C' "$ps51 -NoProfile -NonInteractive -Command `"& '$g' -C C:\sbx\work\r1 log --oneline -1; `$LASTEXITCODE`"" -Expect info -MustContain 'merged' -Ui:$gitUi
     Invoke-Mxc 'pwsh7-starts-git' "`"$pwsh7Dir\pwsh.exe`" -NoProfile -NonInteractive -Command `"$psScript`"" -Expect info -MustContain 'merged' -ExtraReadonly $pwsh7Dir -Ui:$gitUi
     Invoke-Mxc 'ps51-starts-sh' "$ps51 -NoProfile -NonInteractive -Command `"& '$sh' -c 'echo from-sh; exit 0'; `$LASTEXITCODE`"" -Expect info -MustContain 'from-sh' -Ui:$shUi
     Invoke-Mxc 'cmd-starts-git' "cmd.exe /c `"$g --version`"" -Expect info -MustContain 'git version' -Ui:$gitUi
