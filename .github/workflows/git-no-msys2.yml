@@ -17,17 +17,23 @@ permissions:
   contents: read
 jobs:
   build:
-    name: build git (${{ matrix.arch }}, MSVC + busybox tools)
+    name: build git (${{ matrix.variant }}, MSVC + busybox tools)
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
+          - variant: x64
             runner: windows-2025
             busybox: https://frippery.org/files/busybox/busybox64.exe
-          - arch: arm64
+            delayload: false
+          - variant: arm64
             runner: windows-11-arm
             busybox: https://frippery.org/files/busybox/busybox64a.exe
+            delayload: false
+          - variant: arm64-delayload-user32
+            runner: windows-11-arm
+            busybox: https://frippery.org/files/busybox/busybox64a.exe
+            delayload: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -46,7 +52,7 @@ jobs:
       - run: pip install meson ninja pefile
       - name: Build (MSYS2 and Git for Windows hidden)
         shell: pwsh
-        run: scratch/git-no-msys2/build-git.ps1 -Source gitsrc -Prefix C:/git-native -BusyboxUrl ${{ matrix.busybox }}
+        run: scratch/git-no-msys2/build-git.ps1 -Source gitsrc -Prefix C:/git-native -BusyboxUrl ${{ matrix.busybox }} -DelayLoadUser32:$${{ matrix.delayload }}
       - name: Restore hidden directories
         if: always()
         shell: pwsh
@@ -63,21 +69,20 @@ jobs:
           C:\git-native\bin\git.exe --exec-path
       - uses: actions/upload-artifact@v4
         with:
-          name: git-native-${{ matrix.arch }}
+          name: git-native-${{ matrix.variant }}
           path: C:/git-native
           retention-days: 7
 
   build-mxc:
     # Built from source: current MXC has no AppContainer fallback tiers, so the
     # probe and every launch either use native BaseContainer (PSEC) or refuse.
+    # Only windows-11-arm (Windows 11 25H2) has the native PSEC API set; the x64
+    # windows-2025 image is Windows Server and probes without it.
     name: build wxc-exec (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: windows-2025
-            target: x86_64-pc-windows-msvc
           - arch: arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -109,20 +114,22 @@ jobs:
           retention-days: 7
 
   mxc:
-    name: MXC ProcessContainer (${{ matrix.arch }}, ${{ matrix.runner }})
+    name: MXC BaseContainer (${{ matrix.variant }}, Win32k for git ${{ matrix.git_ui && 'allowed' || 'blocked' }})
     needs: [build, build-mxc]
     if: ${{ !cancelled() && needs.build-mxc.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: windows-2025
-            busybox: https://frippery.org/files/busybox/busybox64.exe
-          - arch: arm64
-            runner: windows-11-arm
-            busybox: https://frippery.org/files/busybox/busybox64a.exe
-    runs-on: ${{ matrix.runner }}
+          - variant: arm64
+            arch: arm64
+            git_ui: true
+          - variant: arm64-delayload-user32
+            arch: arm64
+            git_ui: false
+    runs-on: windows-11-arm
+    env:
+      BUSYBOX_URL: https://frippery.org/files/busybox/busybox64a.exe
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -131,7 +138,7 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: git-native-${{ matrix.arch }}
+          name: git-native-${{ matrix.variant }}
           path: C:/git-native
       - uses: actions/download-artifact@v4
         with:
@@ -139,7 +146,7 @@ jobs:
           path: ${{ runner.temp }}/mxc
       - name: Fetch busybox-w32
         shell: pwsh
-        run: Invoke-WebRequest ${{ matrix.busybox }} -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
+        run: Invoke-WebRequest $env:BUSYBOX_URL -OutFile (Join-Path $env:RUNNER_TEMP 'busybox.exe')
       - name: Run git and busybox inside ProcessContainer
         shell: pwsh
         run: >
@@ -148,8 +155,9 @@ jobs:
           -GitRoot C:\git-native
           -BusyboxExe "$env:RUNNER_TEMP\busybox.exe"
           -OutDir "$env:RUNNER_TEMP\mxc-out"
+          -GitWithoutUi:$${{ !matrix.git_ui }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mxc-results-${{ matrix.arch }}
+          name: mxc-results-${{ matrix.variant }}-gitui-${{ matrix.git_ui }}
           path: ${{ runner.temp }}/mxc-out

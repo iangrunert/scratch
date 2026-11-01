@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory)] [string] $BusyboxExe,
     [Parameter(Mandatory)] [string] $OutDir,
     # The run is only meaningful on the native ProcessContainer (BaseContainer/PSEC) tier.
-    [string] $RequireTier = 'base-container'
+    [string] $RequireTier = 'base-container',
+    # Run the git-only cases with Win32k blocked (the ProcessContainer default).
+    [switch] $GitWithoutUi
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -122,16 +124,17 @@ Invoke-Mxc 'bb-as-sh.exe' "$bb\sh.exe -c `"echo via-sh-exe`"" -MustContain 'via-
 # --- native git -------------------------------------------------------------
 if ($haveGit) {
     $g = "$git\bin\git.exe"
-    Invoke-Mxc 'git-version' "$g --version --build-options" -MustContain 'git version'
+    $gitUi = -not $GitWithoutUi
+    Invoke-Mxc 'git-version' "$g --version --build-options" -MustContain 'git version' -Ui:$gitUi
     Invoke-Mxc 'git-init-commit-log' ("cmd.exe /c `"$g init -q r1 && cd r1 && echo hello> a.txt && $g add a.txt && " +
-        "$g commit -q -m first && echo more>> a.txt && $g commit -q -am second && $g log --oneline && $g status --short && $g diff HEAD~1 --stat`"") -MustContain 'second'
+        "$g commit -q -m first && echo more>> a.txt && $g commit -q -am second && $g log --oneline && $g status --short && $g diff HEAD~1 --stat`"") -MustContain 'second' -Ui:$gitUi
     Invoke-Mxc 'git-branch-merge' ("cmd.exe /c `"cd r1 && $g switch -q -c topic && echo t> t.txt && $g add t.txt && $g commit -q -m topic && " +
-        "$g switch -q master && $g merge -q --no-ff -m merged topic && $g log --graph --oneline -5`"") -MustContain 'merged'
-    Invoke-Mxc 'git-clone-no-local' "$g clone -q --no-local r1 r2" # spawns upload-pack
-    Invoke-Mxc 'git-gc-fsck' "cmd.exe /c `"cd r2 && $g gc -q && $g fsck && $g count-objects -v`"" -MustContain 'count'
+        "$g switch -q master && $g merge -q --no-ff -m merged topic && $g log --graph --oneline -5`"") -MustContain 'merged' -Ui:$gitUi
+    Invoke-Mxc 'git-clone-no-local' "$g clone -q --no-local r1 r2" -Ui:$gitUi  # spawns upload-pack
+    Invoke-Mxc 'git-gc-fsck' "cmd.exe /c `"cd r2 && $g gc -q && $g fsck && $g count-objects -v`"" -MustContain 'count' -Ui:$gitUi
     Invoke-Mxc 'git-stash-rebase' ("cmd.exe /c `"cd r2 && echo w>> a.txt && $g stash -q && $g stash list && $g stash pop -q && $g checkout -q -- . && " +
-        "$g rebase -q HEAD~1 && $g log --oneline -1`"")
-    Invoke-Mxc 'git-write-outside' "$g init -q $outside\repo" -Expect fail
+        "$g rebase -q HEAD~1 && $g log --oneline -1`"") -Ui:$gitUi
+    Invoke-Mxc 'git-write-outside' "$g init -q $outside\repo" -Expect fail -Ui:$gitUi
 
     # Features that need a POSIX shell, served by busybox sh.exe on PATH.
     Invoke-Mxc 'git-config-shell-alias' "$g -C r1 config alias.hi `"!echo alias-ran-in-sh `$((1+1))`"" -Ui
@@ -145,8 +148,8 @@ if ($haveGit) {
     Invoke-Mxc 'git-difftool-extcmd' "$bb\sh.exe -c `"cd r1 && git difftool -y --extcmd='diff -u' HEAD~2 HEAD -- a.txt; echo rc=`$?`"" -MustContain 'more' -Ui
     Invoke-Mxc 'git-sh-scripts-in-busybox' "$bb\sh.exe -c `"cd r1 && . `$(git --exec-path)/git-sh-setup && echo top=`$(git rev-parse --show-toplevel)`"" -MustContain 'top=' -Ui
     Invoke-Mxc 'git-submodule-sh-wrapper' "$bb\sh.exe -c `"cd r1 && git -c protocol.file.allow=always submodule add -q C:/sbx/work/r2 sub && git submodule status`"" -MustContain ' sub' -Ui
-    Invoke-Mxc 'git-https-ls-remote' "$g ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
-    Invoke-Mxc 'git-https-ls-remote-schannel' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network
+    Invoke-Mxc 'git-https-ls-remote' "$g ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network -Ui:$gitUi
+    Invoke-Mxc 'git-https-ls-remote-schannel' "$g -c http.sslBackend=schannel ls-remote https://github.com/git/git refs/heads/master" -Expect info -Network -Ui:$gitUi
 }
 
 # --- Report -----------------------------------------------------------------

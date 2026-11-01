@@ -4,7 +4,11 @@
 param(
     [Parameter(Mandatory)] [string] $Source,
     [Parameter(Mandatory)] [string] $Prefix,
-    [Parameter(Mandatory)] [string] $BusyboxUrl
+    [Parameter(Mandatory)] [string] $BusyboxUrl,
+    # compat/poll uses the user32 message pump, so every git binary imports
+    # user32.dll and needs Win32k at load time. Delay-loading defers that until
+    # poll() actually pumps messages.
+    [switch] $DelayLoadUser32
 )
 $ErrorActionPreference = 'Stop'
 
@@ -47,7 +51,8 @@ try {
         -Druntime_prefix=true `
         -Dperl=disabled -Dpython=disabled -Drust=disabled `
         -Dgettext=disabled -Dgitk=disabled -Dgit_gui=disabled -Dgitweb=disabled `
-        -Dcredential_helpers=wincred
+        -Dcredential_helpers=wincred `
+        $(if ($DelayLoadUser32) { '-Dc_link_args=/DELAYLOAD:user32.dll delayimp.lib' })
     if ($LASTEXITCODE) { throw "meson setup failed ($LASTEXITCODE)" }
     meson compile -C build
     if ($LASTEXITCODE) { throw "meson compile failed ($LASTEXITCODE)" }
